@@ -1417,6 +1417,29 @@ def _configured_model_options(raw_models: object) -> list[dict[str, str]]:
     ]
 
 
+def _models_config_is_discovered(provider_cfg: object) -> bool:
+    """True when a provider's ``models`` mapping is an auto-discovered catalog.
+
+    Mirrors upstream Hermes Agent's ``_entry_models_discovered``: the current
+    shape is an entry-level ``models_discovered: true`` sibling of ``models``,
+    and older Hermes versions wrote an in-mapping
+    ``__discovered_model_catalog__: true`` sentinel instead (accepted on read
+    for backward compatibility). A catalog Hermes itself persisted after a
+    successful ``/v1/models`` probe is never a user pin, so ``models`` must
+    not be treated as a restricting picker allowlist — the live catalog is
+    authoritative.
+    """
+    if not isinstance(provider_cfg, dict):
+        return False
+    if provider_cfg.get("models_discovered") is True:
+        return True
+    models = provider_cfg.get("models")
+    return (
+        isinstance(models, dict)
+        and models.get("__discovered_model_catalog__") is True
+    )
+
+
 def _named_custom_provider_slugs(config_obj: dict | None = None) -> set[str]:
     return {
         slug
@@ -8057,9 +8080,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     # whichever model had local settings. Only Copilot skips the
                     # config-models allowlist branch and asks Hermes CLI for the
                     # live catalog first (static _PROVIDER_MODELS is fallback only).
+                    # A provider whose ``models`` was persisted by live discovery
+                    # (``models_discovered: true``) is the same class of case:
+                    # the mapping is per-model metadata, not a user pin, so the
+                    # live /v1/models catalog stays authoritative (#7404).
                     _uses_models_as_settings_map = pid == "copilot"
                     if (
                         not _uses_models_as_settings_map
+                        and not _models_config_is_discovered(provider_cfg)
                         and isinstance(provider_cfg, dict)
                         and "models" in provider_cfg
                     ):
