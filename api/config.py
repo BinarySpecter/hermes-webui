@@ -1378,9 +1378,21 @@ def _custom_provider_entries(config_obj: dict | None = None) -> list[dict]:
 
 
 def _configured_model_ids(raw_models: object) -> list[str]:
-    """Return ordered model IDs from supported config allowlist shapes."""
+    """Return ordered model IDs from supported config allowlist shapes.
+
+    Sentinel keys that Hermes persists inside a user-facing ``models`` mapping
+    (``__discovered_model_catalog__``, ``__explicit_model_allowlist__``) are
+    config metadata, never model IDs. Filter them out centrally here (mirroring
+    upstream Hermes Agent's ``_declared_model_ids``) so no downstream model
+    list, static group, provenance path, or fallback path can surface them.
+    """
+    sentinel_keys = {"__discovered_model_catalog__", "__explicit_model_allowlist__"}
     if isinstance(raw_models, dict):
-        candidates = (key for key in raw_models if isinstance(key, str))
+        candidates = (
+            key
+            for key in raw_models
+            if isinstance(key, str) and key not in sentinel_keys
+        )
     elif isinstance(raw_models, list):
         candidates = raw_models
     else:
@@ -5684,7 +5696,18 @@ def _static_models_catalog_without_live_probes() -> dict:
             raw_key = canonical_to_raw_provider_key.get(pid, pid)
             provider_cfg = _get_provider_cfg(raw_key)
             raw_models = []
-            if isinstance(provider_cfg, dict) and "models" in provider_cfg:
+            # A provider whose ``models`` was persisted by live discovery
+            # (``models_discovered: true`` or the legacy in-mapping sentinel) is
+            # a per-model metadata catalog, not a user pin — never treat it as
+            # the complete static picker allowlist. Start from the broader
+            # static/plugin fallback catalog and let persisted model IDs be
+            # merged in below as fallback metadata (mirrors the live-rebuild
+            # chokepoint in _build_available_models_uncached, #7404).
+            if (
+                isinstance(provider_cfg, dict)
+                and "models" in provider_cfg
+                and not _models_config_is_discovered(provider_cfg)
+            ):
                 raw_models = _configured_model_options(provider_cfg["models"])
             if not raw_models:
                 raw_models = copy.deepcopy(_PROVIDER_MODELS.get(pid, []))
