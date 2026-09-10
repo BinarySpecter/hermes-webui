@@ -2776,15 +2776,18 @@ def get_providers() -> dict[str, Any]:
                     pid,
                     exc_info=True,
                 )
-        # Also include models from config.yaml providers section
+        # Also include models from config.yaml providers section. Route the
+        # mapping through _configured_model_ids so metadata sentinels Hermes
+        # persists inside a discovered catalog
+        # (__discovered_model_catalog__ / __explicit_model_allowlist__) never
+        # surface as visible model rows (#7404 review).
         if isinstance(providers_cfg, dict):
             provider_cfg = providers_cfg.get(pid, {})
             if isinstance(provider_cfg, dict) and "models" in provider_cfg:
-                cfg_models = provider_cfg["models"]
-                if isinstance(cfg_models, dict):
-                    models = models + [{"id": k, "label": k} for k in cfg_models.keys()]
-                elif isinstance(cfg_models, list):
-                    models = models + [{"id": k, "label": k} for k in cfg_models]
+                models = models + [
+                    {"id": model_id, "label": model_id}
+                    for model_id in _configured_model_ids(provider_cfg["models"])
+                ]
                 # Recompute models_total when config.yaml contributes additional
                 # entries on top of the live/static catalog. For non-Nous
                 # providers models_total still equals len(models); for Nous

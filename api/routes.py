@@ -21369,6 +21369,7 @@ def _handle_live_models(handler, parsed):
 
     try:
         from api.config import get_config as _gc
+        from api.config import _configured_model_ids, _models_config_is_discovered
         cfg = _gc()
         if not provider:
             provider = cfg.get("model", {}).get("provider") or ""
@@ -21443,17 +21444,11 @@ def _handle_live_models(handler, parsed):
                         _ids.append(_mid)
 
                 _append(_cp.get("model", ""))
-                _models = _cp.get("models")
-                if isinstance(_models, dict):
-                    for _mid in _models:
-                        if isinstance(_mid, str):
-                            _append(_mid)
-                elif isinstance(_models, list):
-                    for _item in _models:
-                        if isinstance(_item, str):
-                            _append(_item)
-                        elif isinstance(_item, dict):
-                            _append(_item.get("id") or _item.get("model") or _item.get("name"))
+                # Go through _configured_model_ids so the metadata sentinels
+                # Hermes persists in a discovered catalog never surface as
+                # selectable model IDs (#7404 review).
+                for _mid in _configured_model_ids(_cp.get("models")):
+                    _append(_mid)
                 return _ids
 
             def _custom_provider_api_key(_cp):
@@ -21603,6 +21598,34 @@ def _handle_live_models(handler, parsed):
                 except Exception as _fetch_err:
                     logger.debug("Live fetch from %s failed: %s", provider, _fetch_err)
                     # Fall through to static list below
+
+        # ── Config allowlist / discovery policy ────────────────────────────
+        # Mirror get_available_models() so this enrichment surface agrees with
+        # the picker: a genuine user pin restricts the returned IDs; a
+        # discovered catalog stays live-authoritative and falls back to the
+        # persisted (sanitized) IDs only when the probe returned nothing;
+        # Copilot's models mapping is per-model settings, never a pin. Route
+        # everything through _configured_model_ids so metadata sentinels never
+        # surface as selectable models (#7404 review).
+        _uses_models_as_settings_map = provider == "copilot"
+        _provider_cfg = {}
+        try:
+            _providers_cfg = cfg.get("providers") or {}
+            if isinstance(_providers_cfg, dict):
+                _provider_cfg = _providers_cfg.get(provider, {})
+        except Exception:
+            _provider_cfg = {}
+        if (
+            not _uses_models_as_settings_map
+            and isinstance(_provider_cfg, dict)
+            and "models" in _provider_cfg
+        ):
+            _configured_ids = _configured_model_ids(_provider_cfg.get("models"))
+            if _models_config_is_discovered(_provider_cfg):
+                if not ids:
+                    ids = list(_configured_ids)
+            else:
+                ids = list(_configured_ids)
 
         # Static fallback — only reached when live fetch also failed.
         if not ids:

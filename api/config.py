@@ -7673,6 +7673,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _cp_has_configured_models = (
                         isinstance(_cp_configured_models, (dict, list))
                         and len(_cp_configured_models) > 0
+                        # A mapping Hermes persisted after a live /v1/models
+                        # probe is per-model metadata, not a user pin. Exclude
+                        # it so the provider still probes (and the live catalog
+                        # stays authoritative) instead of treating the
+                        # discovered catalog as a restricting allowlist (#7404).
+                        and not _models_config_is_discovered(_cp)
                     )
                     _live_models = auto_detected_models_by_provider.get(_slug)
                     _live_error = None
@@ -8219,6 +8225,27 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
                     if not raw_models:
                         raw_models = copy.deepcopy(_PROVIDER_MODELS.get(pid, []))
+                        # A discovered catalog is per-model metadata, not a
+                        # user pin: when the live probe returns nothing the
+                        # broader static catalog is the base, and the persisted
+                        # (sanitized) model IDs are MERGED in as fallback
+                        # metadata so a probe failure does not silently drop a
+                        # discovered-only model from the picker (#7404).
+                        if _models_config_is_discovered(provider_cfg):
+                            for model_id in _configured_model_ids(
+                                provider_cfg.get("models")
+                            ):
+                                if not any(
+                                    m.get("id") == model_id for m in raw_models
+                                ):
+                                    raw_models.append(
+                                        {
+                                            "id": model_id,
+                                            "label": _get_label_for_model(
+                                                model_id, groups
+                                            ),
+                                        }
+                                    )
 
                     detected_models = auto_detected_models_by_provider.get(pid, [])
                     if detected_models and not raw_models:
