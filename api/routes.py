@@ -1895,7 +1895,7 @@ _OPENAI_COMPAT_ENDPOINTS = {
 # specific model filtering happens downstream in hermes_cli.
 #
 _LIVE_MODELS_CACHE_TTL = 60.0
-_LIVE_MODELS_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_LIVE_MODELS_CACHE: dict[tuple[str, str, str], tuple[float, dict]] = {}
 _LIVE_MODELS_CACHE_LOCK = threading.RLock()
 
 
@@ -1912,11 +1912,44 @@ def _active_profile_for_live_models_cache() -> str:
         return "default"
 
 
-def _live_models_cache_key(provider: str) -> tuple[str, str]:
-    return (_active_profile_for_live_models_cache(), provider)
+def _live_models_policy_fingerprint(provider: str) -> str:
+    """Stable, secret-free fingerprint of a provider's live-model policy.
+
+    Folds the INPUTS the discovered-vs-pinned decision reads — whether a
+    matching config entry exists, its discovery marker(s), whether it is a
+    Copilot settings map, and its sanitized configured model IDs — into the
+    live-models cache key.  Without this a discovered catalog could be replayed
+    for up to 60s after the profile is changed to a pin.  Never includes
+    ``api_key`` / ``key_env`` values.
+    """
+    try:
+        from api.config import _live_models_policy_for_provider, get_config
+
+        policy = _live_models_policy_for_provider(provider, get_config())
+        payload = {
+            "source": policy.get("source"),
+            "discovered": bool(policy.get("discovered")),
+            "settings_map": bool(policy.get("settings_map")),
+            "has_models": bool(policy.get("has_models")),
+            "models": list(policy.get("models") or []),
+        }
+    except Exception as _e:
+        logger.debug("_live_models_policy_fingerprint fell back for %s: %s", provider, _e)
+        payload = {"error": "policy_unavailable"}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
 
 
-def _get_cached_live_models(key: tuple[str, str]) -> dict | None:
+def _live_models_cache_key(provider: str) -> tuple[str, str, str]:
+    return (
+        _active_profile_for_live_models_cache(),
+        provider,
+        _live_models_policy_fingerprint(provider),
+    )
+
+
+def _get_cached_live_models(key: tuple[str, str, str]) -> dict | None:
     now = time.monotonic()
     with _LIVE_MODELS_CACHE_LOCK:
         cached = _LIVE_MODELS_CACHE.get(key)
@@ -1929,7 +1962,7 @@ def _get_cached_live_models(key: tuple[str, str]) -> dict | None:
         return copy.deepcopy(payload)
 
 
-def _set_cached_live_models(key: tuple[str, str], payload: dict) -> None:
+def _set_cached_live_models(key: tuple[str, str, str], payload: dict) -> None:
     with _LIVE_MODELS_CACHE_LOCK:
         _LIVE_MODELS_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
 
@@ -21369,8 +21402,8 @@ def _handle_live_models(handler, parsed):
 
     try:
         from api.config import get_config as _gc
-        from api.config import _configured_model_ids, _models_config_is_discovered
-        from api.config import _get_provider_cfg_for_id
+        from api.config import _configured_model_ids
+        from api.config import _get_provider_cfg_for_id, _live_models_policy_for_provider
         cfg = _gc()
         if not provider:
             provider = cfg.get("model", {}).get("provider") or ""
@@ -21606,23 +21639,17 @@ def _handle_live_models(handler, parsed):
         # discovered catalog stays live-authoritative and falls back to the
         # persisted (sanitized) IDs only when the probe returned nothing;
         # Copilot's models mapping is per-model settings, never a pin. Route
-        # everything through _configured_model_ids so metadata sentinels never
-        # surface as selectable models (#7404 review).
-        _uses_models_as_settings_map = provider == "copilot"
-        _provider_cfg = {}
+        # everything through the shared policy resolver so a pin stored in a
+        # ``custom_providers[]`` entry (not just ``providers.<id>``) is
+        # honoured, and always via _configured_model_ids so metadata sentinels
+        # never surface as selectable models (#7404 review).
         try:
-            _providers_cfg = cfg.get("providers") or {}
-            if isinstance(_providers_cfg, dict):
-                _provider_cfg = _get_provider_cfg_for_id(provider, _providers_cfg)
+            _policy = _live_models_policy_for_provider(provider, cfg)
         except Exception:
-            _provider_cfg = {}
-        if (
-            not _uses_models_as_settings_map
-            and isinstance(_provider_cfg, dict)
-            and "models" in _provider_cfg
-        ):
-            _configured_ids = _configured_model_ids(_provider_cfg.get("models"))
-            if _models_config_is_discovered(_provider_cfg):
+            _policy = {}
+        if _policy.get("has_models") and not _policy.get("settings_map"):
+            _configured_ids = list(_policy.get("models") or [])
+            if _policy.get("discovered"):
                 if not ids:
                     ids = list(_configured_ids)
             else:

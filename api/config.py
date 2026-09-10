@@ -2742,6 +2742,102 @@ def _get_provider_cfg_for_id(provider_id, providers_cfg=None) -> dict:
     return provider_cfg if isinstance(provider_cfg, dict) else {}
 
 
+def _matching_custom_provider_entries(provider_id, config_obj=None) -> list[dict]:
+    """Return ``custom_providers[]`` entries matching a requested provider id.
+
+    Mirrors the collection ``_handle_live_models`` performs: a ``custom:<slug>``
+    id matches the entry whose name normalizes to that slug, and the bare
+    ``custom`` id matches unnamed entries.  Kept here so the live-model policy
+    resolver and the live route agree on which entry a request maps to.
+    """
+    raw = str(provider_id or "").strip().lower()
+    if not raw:
+        return []
+    entries = _custom_provider_entries(config_obj)
+    if not entries:
+        return []
+    if raw.startswith("custom:"):
+        return [
+            entry
+            for entry in entries
+            if _custom_provider_slug_from_name(entry.get("name", "")) == raw
+        ]
+    if raw == "custom":
+        return [
+            entry
+            for entry in entries
+            if not _custom_provider_slug_from_name(entry.get("name", ""))
+        ]
+    return []
+
+
+def _live_models_policy_for_provider(provider_id, config_obj=None) -> dict:
+    """Resolve the discovered-vs-pinned live-model policy for *provider_id*.
+
+    One shared resolver for both ``providers{}`` and matching
+    ``custom_providers[]`` entries, so a genuine pin stored in either location
+    restricts the live catalog and a Hermes-persisted discovery catalog stays
+    per-model metadata (live authoritative).  ``provider_id`` may be canonical
+    or raw; the ``providers{}`` lookup resolves alias / mixed-case / underscore
+    ids via ``_resolve_raw_provider_key``.
+
+    Returns a dict:
+
+    - ``source``: ``"providers"``, ``"custom"`` or ``None``.
+    - ``entry``: the matched config mapping (or ``{}``).
+    - ``models``: sanitized configured model IDs (``_configured_model_ids``);
+      for a custom entry the singular ``model`` is prepended.
+    - ``discovered``: ``_models_config_is_discovered(entry)``.
+    - ``settings_map``: True for Copilot, whose ``models`` mapping is per-model
+      settings rather than a picker allowlist.
+    - ``has_models``: True when the matched entry carries a ``models`` key.
+    """
+    result = {
+        "source": None,
+        "entry": {},
+        "models": [],
+        "discovered": False,
+        "settings_map": False,
+        "has_models": False,
+    }
+    if config_obj is None:
+        config_obj = cfg
+    if not isinstance(config_obj, dict):
+        return result
+    requested = str(provider_id or "").strip()
+    providers_cfg = config_obj.get("providers") or {}
+    if isinstance(providers_cfg, dict):
+        provider_cfg = _get_provider_cfg_for_id(requested, providers_cfg)
+        if isinstance(provider_cfg, dict) and "models" in provider_cfg:
+            result.update(
+                source="providers",
+                entry=provider_cfg,
+                models=_configured_model_ids(provider_cfg.get("models")),
+                discovered=_models_config_is_discovered(provider_cfg),
+                settings_map=(
+                    requested.lower() == "copilot"
+                    or _resolve_raw_provider_key(requested, providers_cfg) == "copilot"
+                ),
+                has_models=True,
+            )
+            return result
+    for entry in _matching_custom_provider_entries(requested, config_obj):
+        models = _configured_model_ids(entry.get("models"))
+        singular = str(entry.get("model") or "").strip()
+        if singular and singular not in models:
+            models = [singular] + models
+        result.update(
+            source="custom",
+            entry=entry,
+            models=models,
+            discovered=_models_config_is_discovered(entry),
+            settings_map=False,
+            has_models="models" in entry,
+        )
+        return result
+    return result
+
+
 class AmbiguousCustomProviderError(ValueError):
     """Raised when two+ custom_providers[] entries normalize to the same slug.
 

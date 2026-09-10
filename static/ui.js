@@ -3719,8 +3719,15 @@ async function populateModelDropdown(opts={}){
   }
 }
 
-// Cache so we don't re-fetch on every page load
+// Cache so we don't re-fetch on every page load.
+// Keyed by profile + provider: the endpoint response depends on the active
+// profile, so a profile switch must not append profile A's catalog to profile
+// B's freshly-rendered pinned list (#7404 review).
 const _liveModelCache={};
+function _liveModelCacheKey(provider){
+  const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
+  return profile+'\u0000'+String(provider||'');
+}
 // Tracks providers for which a live-model fetch is in flight.
 // Used by syncTopbar() to defer model corrections until the fetch completes,
 // preventing premature fallback to the first static model (#1169).
@@ -3828,10 +3835,13 @@ function _addLiveModelsToSelect(provider, models, sel){
 async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
   if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
+  // Capture the profile at fetch start so a mid-flight profile switch cannot
+  // file this catalog under the new profile's key.
+  const cacheKey=_liveModelCacheKey(provider);
   // Already fetched — apply cached models to this select element (#872)
-  if(_liveModelCache[provider]){
+  if(_liveModelCache[cacheKey]){
     if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
-    const added=_addLiveModelsToSelect(provider,_liveModelCache[provider],sel);
+    const added=_addLiveModelsToSelect(provider,_liveModelCache[cacheKey],sel);
     if(added>0 && typeof syncModelChip==='function') syncModelChip();
     return;
   }
@@ -3845,7 +3855,7 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
     const data=await _liveRes.json();
     if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(!data.models||!data.models.length) return;
-    _liveModelCache[provider]=data.models;
+    _liveModelCache[cacheKey]=data.models;
     if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){

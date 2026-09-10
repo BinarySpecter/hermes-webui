@@ -819,3 +819,168 @@ def test_pinned_custom_provider_skips_live_probe(monkeypatch, tmp_path):
     assert not calls, f"pinned custom provider probed live: {calls}"
     assert "acme-pinned" in ids
     assert "should-not-appear" not in ids
+
+
+# ── Named custom_providers[] pins + cache authority (#7406 review) ──────────
+#
+# The live route used to merge every ID the custom endpoint returned and only
+# clamped against ``providers{}`` pins, so a pin stored in a matching
+# ``custom_providers[]`` entry was silently widened.  These drive the REAL
+# handler (``routes._handle_live_models``), not the helper functions.
+
+
+def _live_ids_via_handler(monkeypatch, cfg, live_models_by_provider, query_provider,
+                          *, stub_alias=True):
+    from urllib.parse import urlparse
+
+    routes, _ = _live_models_setup(
+        monkeypatch, cfg, live_models_by_provider, stub_alias=stub_alias
+    )
+    parsed = urlparse(f"/api/models/live?provider={query_provider}")
+    payload = routes._handle_live_models(object(), parsed)
+    return routes, [m["id"] for m in payload.get("models", [])]
+
+
+def test_live_models_custom_provider_pin_restricts_live_catalog(monkeypatch, tmp_path):
+    """A pin in a matching ``custom_providers[]`` entry must restrict the
+    returned IDs exactly like a ``providers.<id>`` pin: an unpinned live ID must
+    not leak (maintainer's ``custom:acme`` repro)."""
+    cfg = {
+        "model": {"provider": "custom:acme"},
+        "custom_providers": [
+            {
+                "name": "Acme",
+                "base_url": "http://127.0.0.1:9999/v1",
+                "api_key": "sk-acme",
+                "models": {"pinned-only": {}},
+            }
+        ],
+    }
+    calls = []
+    routes, config = _live_models_setup(monkeypatch, cfg, {})
+    _patch_custom_endpoint_urlopen(
+        monkeypatch,
+        config,
+        {"data": [{"id": "pinned-only"}, {"id": "unpinned-live"}]},
+        calls,
+    )
+    from urllib.parse import urlparse
+
+    payload = routes._handle_live_models(
+        object(), urlparse("/api/models/live?provider=custom:acme")
+    )
+    ids = [m["id"] for m in payload.get("models", [])]
+    assert calls, "expected the custom endpoint probe to run"
+    assert set(ids) == {"pinned-only"}, ids
+    assert "unpinned-live" not in ids
+
+
+def test_live_models_custom_provider_discovery_stays_live_authoritative(monkeypatch, tmp_path):
+    """Over-correction guard: a discovery marker on a ``custom_providers[]``
+    entry makes its ``models`` mapping metadata, so the live catalog stays
+    authoritative (persisted IDs are a probe-failure fallback only)."""
+    cfg = {
+        "model": {"provider": "custom:acme"},
+        "custom_providers": [
+            {
+                "name": "Acme",
+                "base_url": "http://127.0.0.1:9999/v1",
+                "api_key": "sk-acme",
+                "models_discovered": True,
+                "models": {"acme-cached": {}},
+            }
+        ],
+    }
+    calls = []
+    routes, config = _live_models_setup(monkeypatch, cfg, {})
+    _patch_custom_endpoint_urlopen(
+        monkeypatch,
+        config,
+        {"data": [{"id": "acme-live-1"}, {"id": "acme-live-2"}]},
+        calls,
+    )
+    from urllib.parse import urlparse
+
+    payload = routes._handle_live_models(
+        object(), urlparse("/api/models/live?provider=custom:acme")
+    )
+    ids = [m["id"] for m in payload.get("models", [])]
+    assert calls, "expected the custom endpoint probe to run"
+    assert {"acme-live-1", "acme-live-2"}.issubset(set(ids)), ids
+    assert "acme-cached" in ids
+
+
+def test_live_models_cache_invalidated_when_discovered_flips_to_pin(monkeypatch):
+    """A catalog cached while the provider was discovered must not be replayed
+    after the same profile+provider is changed to a strict pin.  The policy
+    fingerprint in the cache key must force a re-evaluation."""
+    cfg = {
+        "model": {"provider": "openai"},
+        "providers": {
+            "openai": {
+                "models_discovered": True,
+                "models": {"gpt-4o": {}},
+            }
+        },
+    }
+    routes, _ = _live_models_setup(
+        monkeypatch, cfg, {"openai": ["gpt-4o", "gpt-5-discovered"]}
+    )
+    from urllib.parse import urlparse
+
+    parsed = urlparse("/api/models/live?provider=openai")
+    first = routes._handle_live_models(object(), parsed)
+    first_ids = [m["id"] for m in first["models"]]
+    assert "gpt-5-discovered" in first_ids
+
+    # Same profile + provider, but the entry is now a genuine pin.
+    cfg["providers"]["openai"] = {"models": {"gpt-4o": {}}}
+    second = routes._handle_live_models(object(), parsed)
+    second_ids = [m["id"] for m in second["models"]]
+    assert set(second_ids) == {"gpt-4o"}, second_ids
+    assert "gpt-5-discovered" not in second_ids
+
+
+def test_live_models_cache_scoped_by_profile(monkeypatch):
+    """A catalog cached for profile A must not be served for profile B."""
+    cfg = {
+        "model": {"provider": "openai"},
+        "providers": {
+            "openai": {
+                "models_discovered": True,
+                "models": {"gpt-4o": {}},
+            }
+        },
+    }
+    live = {"openai": ["gpt-4o", "gpt-5-profile-a"]}
+    routes, _ = _live_models_setup(monkeypatch, cfg, live)
+    monkeypatch.setattr(routes, "_active_profile_for_live_models_cache", lambda: "profile-a")
+    from urllib.parse import urlparse
+
+    parsed = urlparse("/api/models/live?provider=openai")
+    ids_a = [m["id"] for m in routes._handle_live_models(object(), parsed)["models"]]
+    assert "gpt-5-profile-a" in ids_a
+
+    live["openai"] = ["gpt-4o", "gpt-5-profile-b"]
+    monkeypatch.setattr(routes, "_active_profile_for_live_models_cache", lambda: "profile-b")
+    ids_b = [m["id"] for m in routes._handle_live_models(object(), parsed)["models"]]
+    assert "gpt-5-profile-b" in ids_b
+    assert "gpt-5-profile-a" not in ids_b
+
+
+def test_live_models_discovered_control_still_broad(monkeypatch):
+    """Control: the unchanged ``providers{}`` discovered path still returns the
+    broad live catalog."""
+    cfg = {
+        "model": {"provider": "openai"},
+        "providers": {
+            "openai": {
+                "models_discovered": True,
+                "models": {"gpt-4o": {}},
+            }
+        },
+    }
+    _, ids = _live_ids_via_handler(
+        monkeypatch, cfg, {"openai": ["gpt-4o", "gpt-5-discovered"]}, "openai"
+    )
+    assert {"gpt-4o", "gpt-5-discovered"}.issubset(set(ids)), ids
