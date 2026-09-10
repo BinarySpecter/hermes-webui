@@ -351,7 +351,7 @@ def _install_fake_provider_model_ids(monkeypatch, fn):
     monkeypatch.setitem(sys.modules, "hermes_cli.models", models)
 
 
-def _live_models_setup(monkeypatch, cfg, live_models_by_provider):
+def _live_models_setup(monkeypatch, cfg, live_models_by_provider, *, stub_alias=True):
     import api.config as config
     import api.routes as routes
 
@@ -362,7 +362,8 @@ def _live_models_setup(monkeypatch, cfg, live_models_by_provider):
         lambda _handler, payload, status=200, extra_headers=None: payload,
     )
     monkeypatch.setattr(config, "get_config", lambda: cfg)
-    monkeypatch.setattr(config, "_resolve_provider_alias", lambda provider: provider)
+    if stub_alias:
+        monkeypatch.setattr(config, "_resolve_provider_alias", lambda provider: provider)
     _install_fake_provider_model_ids(
         monkeypatch,
         lambda provider: list(live_models_by_provider.get(provider, [])),
@@ -370,10 +371,12 @@ def _live_models_setup(monkeypatch, cfg, live_models_by_provider):
     return routes, config
 
 
-def _live_ids(monkeypatch, cfg, live_models_by_provider, query_provider):
+def _live_ids(monkeypatch, cfg, live_models_by_provider, query_provider, *, stub_alias=True):
     from urllib.parse import urlparse
 
-    routes, _ = _live_models_setup(monkeypatch, cfg, live_models_by_provider)
+    routes, _ = _live_models_setup(
+        monkeypatch, cfg, live_models_by_provider, stub_alias=stub_alias
+    )
     parsed = urlparse(f"/api/models/live?provider={query_provider}")
     payload = routes._handle_live_models(object(), parsed)
     return [m["id"] for m in payload.get("models", [])]
@@ -473,6 +476,147 @@ def test_live_models_copilot_settings_map_is_not_a_pin(monkeypatch):
     ids = _live_ids(monkeypatch, cfg, {"copilot": live}, "copilot")
     assert set(ids) == set(live)
     assert "__explicit_model_allowlist__" not in ids
+
+
+# ── Aliased config keys must still hit the pin policy (#7406 alias gap) ─────
+#
+# ``/api/models/live`` resolves the requested provider id to its canonical slug
+# (``z-ai`` -> ``zai``, ``google`` -> ``gemini``) but config.yaml stores the
+# entry under the RAW key the user wrote.  The old lookup keyed straight off the
+# canonical slug, missed the entry, skipped the discovered-vs-pinned block, and
+# returned the full live catalog -- bypassing a genuine pin.  These tests must
+# NOT stub ``_resolve_provider_alias`` to identity (which is what hid the bug).
+
+
+def test_live_models_aliased_config_key_genuine_pin_restricts(monkeypatch):
+    """The exact P1: ``providers: {"z-ai": ...}`` queried as canonical ``zai``
+    must apply the user's allowlist, not return the whole live catalog."""
+    cfg = {
+        "model": {"provider": "zai"},
+        "providers": {
+            "z-ai": {"models": {"glm-4": {}, "glm-4-air": {}}},
+        },
+    }
+    ids = _live_ids(
+        monkeypatch,
+        cfg,
+        {"zai": ["glm-4", "glm-4-air", "glm-4-unpinned"]},
+        "zai",
+        stub_alias=False,
+    )
+    assert set(ids) == {"glm-4", "glm-4-air"}
+    assert "glm-4-unpinned" not in ids
+
+
+def test_live_models_aliased_config_key_discovered_is_live_authoritative(monkeypatch):
+    """The alias fix must not over-correct: a discovered aliased entry keeps the
+    live catalog authoritative."""
+    cfg = {
+        "model": {"provider": "zai"},
+        "providers": {
+            "z-ai": {
+                "models_discovered": True,
+                "models": {"glm-4": {}},
+            },
+        },
+    }
+    ids = _live_ids(
+        monkeypatch,
+        cfg,
+        {"zai": ["glm-4", "glm-4-discovered"]},
+        "zai",
+        stub_alias=False,
+    )
+    assert set(ids) == {"glm-4", "glm-4-discovered"}
+
+
+def test_live_models_mixed_case_config_key_pin_restricts(monkeypatch):
+    """A mixed-case raw key (``CLIPpoxy``) must resolve to its config entry."""
+    cfg = {
+        "model": {"provider": "clippoxy"},
+        "providers": {
+            "CLIPpoxy": {"models": {"clip-model-a": {}}},
+        },
+    }
+    ids = _live_ids(
+        monkeypatch,
+        cfg,
+        {"clippoxy": ["clip-model-a", "clip-model-b"]},
+        "clippoxy",
+        stub_alias=False,
+    )
+    assert set(ids) == {"clip-model-a"}
+
+
+def test_live_models_underscore_config_key_pin_restricts(monkeypatch):
+    """An underscore raw key (``opencode_go``) must resolve to its config entry
+    when queried in the canonical hyphenated form."""
+    cfg = {
+        "model": {"provider": "opencode-go"},
+        "providers": {
+            "opencode_go": {"models": {"oc-model-a": {}}},
+        },
+    }
+    ids = _live_ids(
+        monkeypatch,
+        cfg,
+        {"opencode-go": ["oc-model-a", "oc-model-b"]},
+        "opencode-go",
+        stub_alias=False,
+    )
+    assert set(ids) == {"oc-model-a"}
+
+
+def test_resolve_raw_provider_key_maps_aliases_and_case():
+    """Direct unit coverage for the shared raw-key resolver."""
+    from api import config
+
+    providers = {
+        "z-ai": {"models": {"glm-4": {}}},
+        "google": {"models": {"gemini-2.5-pro": {}}},
+        "CLIPpoxy": {"models": {"clip-model-a": {}}},
+        "opencode_go": {"models": {"oc-model-a": {}}},
+        "openai": {"models": {"gpt-4o": {}}},
+    }
+    resolver = config._resolve_raw_provider_key
+    assert resolver("zai", providers) == "z-ai"
+    assert resolver("z-ai", providers) == "z-ai"
+    assert resolver("gemini", providers) == "google"
+    assert resolver("CLIPpoxy", providers) == "CLIPpoxy"
+    assert resolver("clippoxy", providers) == "CLIPpoxy"
+    assert resolver("opencode-go", providers) == "opencode_go"
+    assert resolver("openai", providers) == "openai"
+    assert resolver("mystery", providers) == "mystery"
+    assert resolver("mystery", None) == "mystery"
+
+    assert config._get_provider_cfg_for_id("zai", providers) == providers["z-ai"]
+    assert config._get_provider_cfg_for_id("mystery", providers) == {}
+
+
+def test_provider_api_key_resolves_aliased_config_key(monkeypatch):
+    """``api.providers`` credential resolution must find an aliased entry."""
+    from api import providers as prov
+
+    monkeypatch.setattr(prov, "_provider_env_var_for", lambda _pid: None)
+    monkeypatch.setattr(prov, "_pool_entry_payloads", lambda _pid: [])
+    monkeypatch.setattr(
+        prov,
+        "get_config",
+        lambda: {"providers": {"z-ai": {"api_key": "sk-zai-alias-test"}}},
+    )
+    assert prov._get_provider_api_key("zai") == "sk-zai-alias-test"
+
+
+def test_onboarding_provider_key_present_resolves_aliased_config_key():
+    """Onboarding readiness must not report an aliased provider as
+    unconfigured.  Same class as the /api/models/live alias gap: the setup id
+    is canonical (``zai``) while config.yaml keys the entry ``z-ai``."""
+    from api.onboarding import _provider_api_key_present
+
+    aliased = {"providers": {"z-ai": {"api_key": "sk-test-123"}}}
+    assert _provider_api_key_present("zai", aliased, {}) is True
+    # Control: an entry the user genuinely has not configured stays False.
+    assert _provider_api_key_present("zai", {"providers": {"openai": {"api_key": "x"}}}, {}) is False
 
 
 # ── Settings provider list (review #7406, fix 2) ───────────────────────────

@@ -39,6 +39,7 @@ from api.config import (
     _configured_model_ids,
     _custom_provider_slug_from_name,
     _get_label_for_model,
+    _get_provider_cfg_for_id,
     _models_from_live_provider_ids,
     _pool_entry_payloads,
     _read_live_provider_model_ids,
@@ -1153,7 +1154,7 @@ def _provider_has_shadowed_codex_oauth_value(provider_id: str) -> bool:
             values.append(model_cfg.get("api_key"))
     providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
-        provider_cfg = providers_cfg.get(provider_id, {})
+        provider_cfg = _get_provider_cfg_for_id(provider_id, providers_cfg)
         if isinstance(provider_cfg, dict):
             values.append(provider_cfg.get("api_key"))
     custom_providers = cfg.get("custom_providers", [])
@@ -1321,7 +1322,7 @@ def _provider_has_key(provider_id: str) -> bool:
     # Check providers.<id>.api_key
     providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
-        provider_cfg = providers_cfg.get(provider_id, {})
+        provider_cfg = _get_provider_cfg_for_id(provider_id, providers_cfg)
         if isinstance(provider_cfg, dict) and str(provider_cfg.get("api_key") or "").strip():
             if _provider_value_counts_as_api_key(provider_id, provider_cfg.get("api_key")):
                 return True
@@ -1367,7 +1368,7 @@ def _get_provider_api_key(provider_id: str) -> str | None:
 
     providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
-        provider_cfg = providers_cfg.get(provider_id, {})
+        provider_cfg = _get_provider_cfg_for_id(provider_id, providers_cfg)
         if isinstance(provider_cfg, dict):
             provider_key = str(provider_cfg.get("api_key") or "").strip()
             if _provider_value_counts_as_api_key(provider_id, provider_key):
@@ -3026,7 +3027,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
             # 1. Clean providers.<id>.api_key
             providers_cfg = cfg.get("providers") or {}
             if isinstance(providers_cfg, dict):
-                provider_cfg = providers_cfg.get(provider_id, {})
+                provider_cfg = _get_provider_cfg_for_id(provider_id, providers_cfg)
                 if isinstance(provider_cfg, dict) and provider_cfg.get("api_key"):
                     del provider_cfg["api_key"]
                     changed = True

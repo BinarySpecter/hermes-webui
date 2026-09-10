@@ -21370,6 +21370,7 @@ def _handle_live_models(handler, parsed):
     try:
         from api.config import get_config as _gc
         from api.config import _configured_model_ids, _models_config_is_discovered
+        from api.config import _get_provider_cfg_for_id
         cfg = _gc()
         if not provider:
             provider = cfg.get("model", {}).get("provider") or ""
@@ -21572,7 +21573,7 @@ def _handle_live_models(handler, parsed):
                 try:
                     import urllib.request
                     _providers_cfg = cfg.get("providers") or {}
-                    _prov = _providers_cfg.get(provider, {}) if isinstance(_providers_cfg, dict) else {}
+                    _prov = _get_provider_cfg_for_id(provider, _providers_cfg)
                     # Only use a provider-scoped key.  A top-level model.api_key
                     # is safe here only when it belongs to the requested provider;
                     # otherwise /api/models/live?provider=<other> could forward
@@ -21612,7 +21613,7 @@ def _handle_live_models(handler, parsed):
         try:
             _providers_cfg = cfg.get("providers") or {}
             if isinstance(_providers_cfg, dict):
-                _provider_cfg = _providers_cfg.get(provider, {})
+                _provider_cfg = _get_provider_cfg_for_id(provider, _providers_cfg)
         except Exception:
             _provider_cfg = {}
         if (

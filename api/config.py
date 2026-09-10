@@ -2676,6 +2676,72 @@ def _get_provider_cfg(provider_id) -> dict:
     return provider_cfg if isinstance(provider_cfg, dict) else {}
 
 
+def _resolve_raw_provider_key(provider_id, providers_cfg=None):
+    """Map a provider id back to its RAW key in ``config.yaml`` ``providers:``.
+
+    Most call sites hold an already-canonicalised provider id (aliases resolved
+    by ``_resolve_provider_alias``), but ``config.yaml`` stores the entry under
+    whatever key the user wrote — e.g. ``z-ai``, ``CLIPpoxy`` or
+    ``opencode_go``.  A plain ``providers.get(canonical)`` therefore misses an
+    aliased / mixed-case / underscore-named entry, silently skipping the
+    per-provider config (pins, api_key, reasoning efforts).
+
+    Matching accepts any of the candidate forms the main catalog path builds
+    inline: the exact key, its lowercased form, ``_canonicalise_provider_id``
+    and ``_resolve_provider_alias``.  The comparison is an intersection on ANY
+    form (rather than a single shared normal form) because
+    ``_canonicalise_provider_id`` deliberately preserves ``x-ai`` instead of
+    folding it to ``xai``.
+
+    An exact raw-key hit wins first so behaviour for existing non-aliased
+    configs is unchanged.  The request is returned unchanged when no key
+    matches.  Cheap, side-effect free, no config writes.
+    """
+    if provider_id is None:
+        return provider_id
+    if providers_cfg is None:
+        providers_cfg = _get_providers_cfg()
+    if not isinstance(providers_cfg, dict) or not providers_cfg:
+        return provider_id
+    if provider_id in providers_cfg:
+        return provider_id
+
+    def _match_forms(value):
+        text = str(value)
+        forms = {text, text.strip().lower()}
+        try:
+            forms.add(_canonicalise_provider_id(text))
+        except Exception:
+            pass
+        try:
+            forms.add(_resolve_provider_alias(text.strip().lower()))
+        except Exception:
+            pass
+        forms.discard("")
+        return forms
+
+    requested_forms = _match_forms(provider_id)
+    for key in providers_cfg:
+        if requested_forms & _match_forms(key):
+            return key
+    return provider_id
+
+
+def _get_provider_cfg_for_id(provider_id, providers_cfg=None) -> dict:
+    """Return the ``providers.<raw key>`` config dict for *provider_id*.
+
+    Like ``_get_provider_cfg`` but first resolves alias / mixed-case /
+    underscore ids back to the raw key the user actually wrote, so an aliased
+    provider's config is not silently missed.
+    """
+    if providers_cfg is None:
+        providers_cfg = _get_providers_cfg()
+    if not isinstance(providers_cfg, dict):
+        return {}
+    provider_cfg = providers_cfg.get(_resolve_raw_provider_key(provider_id, providers_cfg), {})
+    return provider_cfg if isinstance(provider_cfg, dict) else {}
+
+
 class AmbiguousCustomProviderError(ValueError):
     """Raised when two+ custom_providers[] entries normalize to the same slug.
 
@@ -4243,7 +4309,7 @@ def _resolve_model_reasoning_efforts_impl(
                     )
                     break
         elif provider:
-            _prov_entry = (cfg.get("providers") or {}).get(provider, {})
+            _prov_entry = _get_provider_cfg_for_id(provider, cfg.get("providers") or {})
             if isinstance(_prov_entry, dict):
                 _re_lists = _configured_reasoning_effort_lists(
                     _prov_entry, hinted_model
@@ -7586,7 +7652,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 providers_cfg = cfg.get("providers", {})
                 if isinstance(providers_cfg, dict):
                     for provider_key in filter(None, [active_provider, "custom"]):
-                        provider_cfg = providers_cfg.get(provider_key, {})
+                        # ``active_provider`` is already alias-resolved, but
+                        # config.yaml stores the entry under the RAW key the user
+                        # wrote (``z-ai``, ``CLIPpoxy``, ``opencode_go``). Resolve
+                        # it back so an aliased provider's api_key is not missed
+                        # (same class as the /api/models/live alias gap).
+                        provider_cfg = _get_provider_cfg_for_id(provider_key, providers_cfg)
                         if isinstance(provider_cfg, dict):
                             api_key = (provider_cfg.get("api_key") or "").strip()
                             if api_key:
