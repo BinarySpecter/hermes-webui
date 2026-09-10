@@ -3719,19 +3719,22 @@ async function populateModelDropdown(opts={}){
   }
 }
 
-// Cache so we don't re-fetch on every page load.
-// Keyed by profile + provider: the endpoint response depends on the active
-// profile, so a profile switch must not append profile A's catalog to profile
-// B's freshly-rendered pinned list (#7404 review).
-const _liveModelCache={};
-function _liveModelCacheKey(provider){
+// No client-side response cache for live models. The server-side
+// /api/models/live cache is keyed by (profile, provider, policy fingerprint),
+// so a browser copy keyed only by profile+provider would replay a broad
+// discovered catalog after the same profile switched to a strict model pin and
+// never reach the policy-aware server cache (#7404 review). Always fetch.
+//
+// Tracks profile+provider pairs with a live-model fetch in flight. Keyed by the
+// same authority as the request so a pending fetch for one profile cannot
+// suppress another profile's fetch. Used by syncTopbar() to defer model
+// corrections until the fetch completes, preventing premature fallback to the
+// first static model (#1169).
+const _liveModelFetchPending=new Set();
+function _liveModelFetchKey(provider){
   const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
   return profile+'\u0000'+String(provider||'');
 }
-// Tracks providers for which a live-model fetch is in flight.
-// Used by syncTopbar() to defer model corrections until the fetch completes,
-// preventing premature fallback to the first static model (#1169).
-const _liveModelFetchPending=new Set();
 
 function _addLiveModelsToSelect(provider, models, sel){
   if(!provider||!models||!models.length||!sel) return 0;
@@ -3836,16 +3839,10 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
   if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
   // Capture the profile at fetch start so a mid-flight profile switch cannot
-  // file this catalog under the new profile's key.
-  const cacheKey=_liveModelCacheKey(provider);
-  // Already fetched — apply cached models to this select element (#872)
-  if(_liveModelCache[cacheKey]){
-    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
-    const added=_addLiveModelsToSelect(provider,_liveModelCache[cacheKey],sel);
-    if(added>0 && typeof syncModelChip==='function') syncModelChip();
-    return;
-  }
-  _liveModelFetchPending.add(provider);
+  // apply this catalog to a different profile's dropdown.
+  const _fetchProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
+  const fetchKey=_liveModelFetchKey(provider);
+  _liveModelFetchPending.add(fetchKey);
   try{
     const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
@@ -3855,8 +3852,10 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
     const data=await _liveRes.json();
     if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(!data.models||!data.models.length) return;
-    _liveModelCache[cacheKey]=data.models;
-    if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
+    // Re-verify the profile captured before the await: if the active profile
+    // changed mid-flight this catalog no longer belongs to the current view.
+    const _currentProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
+    if(_currentProfile!==_fetchProfile) return;
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
       if(typeof syncModelChip==='function') syncModelChip();
@@ -3865,7 +3864,7 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
   }catch(e){
     console.debug('[hermes] Live model fetch failed for',provider,e.message);
   }finally{
-    _liveModelFetchPending.delete(provider);
+    _liveModelFetchPending.delete(fetchKey);
   }
 }
 
@@ -11193,7 +11192,7 @@ function syncTopbar(){
         // Also defer if a live model fetch is still in flight — the model may be
         // in the list once the fetch completes. Persisting now would corrupt the
         // session with the wrong model before live models arrive (#1169).
-        const liveStillPending=window._activeProvider&&_liveModelFetchPending.has(window._activeProvider);
+        const liveStillPending=window._activeProvider&&_liveModelFetchPending.has(_liveModelFetchKey(window._activeProvider));
         if(liveStillPending||missingModelIsRoutable){
           // Live fetch in flight — don't touch sel.value or S.session.model yet.
           // _addLiveModelsToSelect() will re-apply S.session.model once done (#1169).

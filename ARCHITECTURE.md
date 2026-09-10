@@ -744,12 +744,18 @@ limits) and never a picker pin.
 One shared resolver applies this policy for both `providers{}` and matching
 `custom_providers[]` entries: `_live_models_policy_for_provider()` in
 `api/config.py`. A pin stored in either location restricts; a discovery marker
-in either location is metadata. The policy is applied on the main catalog build
-in `get_available_models()` — including its network-free static fallback,
-`_static_models_catalog_without_live_probes()` — and on `/api/models/live`. The
-same provider-config resolution and sentinel filtering back the Settings provider
-list in `api/providers.py`, the provider credential helpers, the reasoning-effort
-config lookup, and the onboarding readiness check in `api/onboarding.py`.
+in either location is metadata. That resolver is the authority used by the live
+route, `/api/models/live`. The main catalog path — `get_available_models()` and
+its network-free static fallback,
+`_static_models_catalog_without_live_probes()` — does not call the resolver; it
+mirrors the same policy with its own `_models_config_is_discovered()` checks.
+That duplication is deliberate (those paths carry their own admission gating and
+produce a different catalog shape), but it means the resolver and the mirrored
+checks must be kept in sync whenever the discovered-versus-pinned policy
+changes. The same provider-config resolution and sentinel filtering back the
+Settings provider list in `api/providers.py`, the provider credential helpers,
+the reasoning-effort config lookup, and the onboarding readiness check in
+`api/onboarding.py`.
 
 ### Live-model response caching
 
@@ -762,9 +768,12 @@ configured model IDs. It never includes credential values such as `api_key` or
 `key_env`. This is what stops a discovered catalog being replayed after the same
 profile and provider are switched to a pin.
 
-The browser mirrors this: `_liveModelCache` in `static/ui.js` is keyed by profile
-and provider, with the key captured at fetch start so a mid-flight profile switch
-cannot file one profile's catalog under another profile's key.
+The browser keeps no response cache of its own. `static/ui.js` always fetches
+`/api/models/live` and relies on the policy-keyed server cache above, because a
+profile-and-provider-only browser copy would go stale on a same-profile policy
+change. It captures the active profile at fetch start and re-checks it before
+applying a response, so a mid-flight profile switch cannot file one profile's
+catalog under another profile's view.
 
 ---
 

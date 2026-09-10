@@ -667,7 +667,23 @@ def test_populate_model_dropdown_accepts_session_visit_freshness_and_guards_stal
     assert "const requestSeq=++_modelDropdownRequestSeq" in body
     assert body.count("requestSeq!==_modelDropdownRequestSeq") >= 3
     assert "_fetchLiveModels(data.active_provider, sel, requestSeq)" in body
-    assert live_tail.count("requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq") >= 4
+    # `_fetchLiveModels` must re-check the request sequence at every async
+    # boundary before touching the DOM. The count was calibrated at 4 when a
+    # redundant duplicate guard sat after the client-side cache assignment; the
+    # browser response cache was removed (#7406), taking its guard with it, so 3
+    # covers the remaining boundaries (entry, post-fetch, post-json).
+    assert live_tail.count("requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq") >= 3
+    # The removed cache also lost its "this cached payload is still current"
+    # protection, so the profile captured before the await must be re-verified
+    # before the response is applied (#7406).
+    assert "_fetchProfile" in live_tail, (
+        "_fetchLiveModels must capture the active profile before awaiting so a "
+        "mid-flight profile switch cannot apply the response (#7406)"
+    )
+    assert "_currentProfile!==_fetchProfile" in live_tail, (
+        "_fetchLiveModels must re-verify the captured profile before applying a "
+        "response to the DOM (#7406)"
+    )
 
 
 def test_load_session_schedules_session_visit_model_refresh_before_message_load():

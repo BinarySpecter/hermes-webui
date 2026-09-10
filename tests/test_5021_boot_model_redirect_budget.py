@@ -40,7 +40,10 @@ function extractFunction(source, name) {
   const marker = `async function ${name}`;
   const start = source.indexOf(marker);
   if (start < 0) throw new Error(`missing function: ${name}`);
-  const end = source.indexOf("\n// Cache so we don't re-fetch on every page load", start);
+  // Anchor on the next top-level declaration rather than on a prose comment:
+  // the previous marker was the "Cache so we don't re-fetch" comment, which
+  // disappeared when the browser live-model response cache was removed (#7406).
+  const end = source.indexOf("\nconst _liveModelFetchPending", start);
   if (end < 0) throw new Error(`missing end marker after: ${name}`);
   return source.slice(start, end);
 }
