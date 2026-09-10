@@ -3730,10 +3730,20 @@ async function populateModelDropdown(opts={}){
 // suppress another profile's fetch. Used by syncTopbar() to defer model
 // corrections until the fetch completes, preventing premature fallback to the
 // first static model (#1169).
-const _liveModelFetchPending=new Set();
+const _liveModelFetchPending=new Map();
 function _liveModelFetchKey(provider){
   const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
   return profile+'\u0000'+String(provider||'');
+}
+function _liveModelFetchBegin(provider){
+  const key=_liveModelFetchKey(provider);
+  _liveModelFetchPending.set(key,(_liveModelFetchPending.get(key)||0)+1);
+  return key;
+}
+function _liveModelFetchEnd(key){
+  const remaining=(_liveModelFetchPending.get(key)||0)-1;
+  if(remaining>0)_liveModelFetchPending.set(key,remaining);
+  else _liveModelFetchPending.delete(key);
 }
 
 function _addLiveModelsToSelect(provider, models, sel){
@@ -3841,8 +3851,7 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
   // Capture the profile at fetch start so a mid-flight profile switch cannot
   // apply this catalog to a different profile's dropdown.
   const _fetchProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
-  const fetchKey=_liveModelFetchKey(provider);
-  _liveModelFetchPending.add(fetchKey);
+  const fetchKey=_liveModelFetchBegin(provider);
   try{
     const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
@@ -3864,7 +3873,7 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
   }catch(e){
     console.debug('[hermes] Live model fetch failed for',provider,e.message);
   }finally{
-    _liveModelFetchPending.delete(fetchKey);
+    _liveModelFetchEnd(fetchKey);
   }
 }
 
@@ -11191,7 +11200,9 @@ function syncTopbar(){
         const missingModelIsRoutable=_providerDefersMissingModelFallback(S.session.model_provider||window._activeProvider||null);
         // Also defer if a live model fetch is still in flight — the model may be
         // in the list once the fetch completes. Persisting now would corrupt the
-        // session with the wrong model before live models arrive (#1169).
+        // session with the wrong model before live models arrive (#1169). The
+        // entry is reference-counted, so it persists until the LAST in-flight
+        // request for this key completes (overlapping fetches share one key).
         const liveStillPending=window._activeProvider&&_liveModelFetchPending.has(_liveModelFetchKey(window._activeProvider));
         if(liveStillPending||missingModelIsRoutable){
           // Live fetch in flight — don't touch sel.value or S.session.model yet.

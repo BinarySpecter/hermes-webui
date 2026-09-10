@@ -23,6 +23,11 @@ WHY THIS EXISTS
   A third case exercises the in-flight profile re-verification: a response for
   the profile captured at fetch start must be dropped if the profile changed
   before it was applied.
+  A fourth case exercises the reference-counted pending entry (#7404 review):
+  two overlapping fetches for the same profile+provider share one key, and the
+  key must stay pending until the older one has resolved and only clear when the
+  last one resolves. The route handler is put in "hold" mode so response timing
+  is released deterministically from the test (never with a blocking sleep).
 
 USAGE
   python tests/browser_live_model_policy.py
@@ -65,6 +70,8 @@ PROFILE_A = "policy-profile-a"
 PROFILE_B = "policy-profile-b"
 PROFILE_INFLIGHT = "policy-profile-inflight"
 PROFILE_INFLIGHT_RACED = "policy-profile-inflight-raced"
+PROFILE_CONCURRENT = "policy-profile-concurrent"
+CONCURRENT_CATALOG = [{"id": "concurrent-live-1", "label": "Concurrent Live 1"}]
 
 BENIGN = [
     "favicon",
@@ -148,6 +155,34 @@ def _wait_for_live_requests(page, count: int, timeout: float = 8000.0) -> bool:
         return False
 
 
+def _wait_for_js(page, expression: str, arg=None, timeout: float = 8000.0) -> bool:
+    """Return True once *expression* is truthy in the page, else False.
+
+    ``wait_for_function`` raises on timeout; this normalises that to a bool and
+    always pumps Playwright's event loop until the condition holds.
+    """
+    try:
+        page.wait_for_function(expression, arg=arg, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _wait_for_held_routes(stub: "LiveModelStub", count: int, page, timeout: float = 8000.0) -> bool:
+    """Pump Playwright until *count* live routes are held by the stub.
+
+    Uses ``page.wait_for_timeout`` so each iteration advances Playwright's event
+    loop (which is what actually dispatches route handlers); a Python
+    ``time.sleep`` would deadlock the interception.
+    """
+    deadline = time.time() + timeout
+    while len(stub.held_routes) < count:
+        if time.time() > deadline:
+            return False
+        page.wait_for_timeout(25)
+    return True
+
+
 def _capture_page_errors(page) -> list[tuple[str, str]]:
     errors: list[tuple[str, str]] = []
 
@@ -171,6 +206,11 @@ class LiveModelStub:
         self.live_models: list[dict] = []
         self.live_request_count = 0
         self.live_requests: list[str] = []
+        # When set, live responses are held instead of fulfilled so the test can
+        # release overlapping requests one at a time, deterministically.
+        self.hold_live = False
+        self.held_routes: list = []
+        self.fulfilled_count = 0
 
     @staticmethod
     def _is_live_url(url: str) -> bool:
@@ -196,6 +236,13 @@ class LiveModelStub:
     def handle_live(self, route) -> None:
         self.live_request_count += 1
         self.live_requests.append(route.request.url)
+        if self.hold_live:
+            self.held_routes.append(route)
+            return
+        self.release_live(route)
+
+    def release_live(self, route) -> None:
+        self.fulfilled_count += 1
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -400,6 +447,69 @@ def main() -> int:
                 f"to {PROFILE_INFLIGHT_RACED!r}; observed options={ids_after_inflight!r}"
             )
         print("OK  in-flight response dropped after profile changed:", ids_after_inflight)
+
+        # --- Case 4: overlapping requests must keep the pending key alive -----
+        #
+        # syncTopbar() defers a model correction while a fetch is pending, so the
+        # observable requirement is: while ANY request for a key is in flight,
+        # _liveModelFetchPending.has(key) must be true. This case asserts on
+        # .has() only — .has() exists on both a Set (the pre-fix shape, which
+        # cleared the key as soon as ANY request finished) and the current
+        # reference-counted Map. That way it fails pre-fix for the RACE rather
+        # than for an API mismatch (e.g. .get is not a function on a Set).
+        page.evaluate(f"S.activeProfile = {PROFILE_CONCURRENT!r}")
+        stub.live_models = list(CONCURRENT_CATALOG)
+        pending_key = page.evaluate(f"() => _liveModelFetchKey({PROVIDER!r})")
+        # Hold live responses so both fetches are genuinely in flight at once.
+        # They are released explicitly below; no blocking sleep is used.
+        stub.hold_live = True
+        stub.held_routes = []
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 2, page):
+            raise AssertionError(
+                "concurrency: expected two overlapping /api/models/live "
+                f"requests to be held; held={len(stub.held_routes)} "
+                f"total={stub.live_request_count}"
+            )
+        if not page.evaluate("key => _liveModelFetchPending.has(key)", pending_key):
+            raise AssertionError(
+                "concurrency: key must be pending while both requests are in flight"
+            )
+
+        # Release ONLY the older response. Its completion is observable: the
+        # catalog it carries reaches the dropdown. The newer request is still
+        # held, so the key MUST still be pending afterwards.
+        stub.release_live(stub.held_routes[0])
+        if not _wait_for_option(page, "concurrent-live-1"):
+            raise AssertionError(
+                "concurrency: the first (older) request never completed after "
+                f"being released; options={_option_values(page)!r}"
+            )
+        if not page.evaluate("key => _liveModelFetchPending.has(key)", pending_key):
+            raise AssertionError(
+                "concurrency: pending entry cleared after the FIRST of two "
+                "overlapping requests completed while a newer request for the same "
+                "profile+provider is still in flight — syncTopbar() would now "
+                "persist a static fallback over the session's intended model"
+            )
+        print("OK  pending key survived the first of two overlapping requests")
+
+        # Release the last response; only now may the key clear.
+        stub.release_live(stub.held_routes[1])
+        if not _wait_for_js(
+            page, "key => !_liveModelFetchPending.has(key)", pending_key
+        ):
+            raise AssertionError(
+                "concurrency: pending entry did not clear after the LAST "
+                "overlapping request completed; still pending"
+            )
+        print("OK  pending key cleared after the last overlapping request")
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")
