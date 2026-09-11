@@ -9271,7 +9271,7 @@ async function loadSettingsPanel(){
       // is already in flight (nor vice versa). The unrequestSeq'd
       // _fetchLiveModels() call below starts its own replacement for
       // settingsModel, so do NOT route through _liveModelPolicyChanged() (that
-      // would double-fetch).
+      // drives the composer and would double-fetch here).
       if(typeof _liveModelAdvanceSelectIdentity==='function') _liveModelAdvanceSelectIdentity(modelSel);
       modelSel.innerHTML='';
       let models=null;
@@ -11883,23 +11883,17 @@ async function _saveSelfHostedProvider(providerId){
 // loaded yet (e.g. during early Settings open) cannot break the save flow.
 function _refreshModelDropdownsAfterProviderChange(){
   try{
-    // #7404 review: a provider add/remove/refresh is an authoritative policy
-    // change, so advance the live-model generation. Any in-flight response for
-    // the previous provider policy is rejected at apply time. Already starts a
-    // replacement rebuild below, so do NOT route through
-    // _liveModelPolicyChanged() (that would double-fetch).
-    if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
     if(typeof window._invalidateSlashModelCache==='function'){
       window._invalidateSlashModelCache();
     }
-    // Fire-and-forget: don't block the providers panel refresh on a
-    // dropdown rebuild. The composer/Settings dropdowns will catch up
-    // on the very next paint frame.
-    if(typeof window._ensureModelDropdownReady==='function'){
-      window._modelDropdownReady=null;
-      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
-    }else if(typeof populateModelDropdown==='function'){
-      Promise.resolve(populateModelDropdown()).catch(()=>{});
+    // #7404 review: a provider add/remove/refresh is an authoritative policy
+    // change. Route through _liveModelPolicyChanged() so the generation advance
+    // and the replacement rebuild share one owner: it synchronously retains the
+    // composer's pending entry across the generation change (no visibility gap)
+    // and starts the replacement rebuild exactly once. Do NOT rebuild here as
+    // well -- that would double-fetch.
+    if(typeof _liveModelPolicyChanged==='function'){
+      _liveModelPolicyChanged();
     }
   }catch(_e){
     // Swallow — dropdown refresh is best-effort, providers panel must still update.

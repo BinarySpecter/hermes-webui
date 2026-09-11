@@ -91,6 +91,9 @@ AFTER_POLICY_CATALOG = [{"id": "after-policy-live-1", "label": "After Policy Liv
 PROFILE_TARGET_A = "policy-profile-target-a"
 PROFILE_TARGET_B = "policy-profile-target-b"
 PROFILE_TARGET_PENDING = "policy-profile-target-pending"
+# #7404 review: the policy-change pending-visibility gap. The composer key must
+# never be absent across _liveModelPolicyChanged()'s generation advance.
+PROFILE_POLICY_GAP = "policy-profile-gap"
 COMPOSER_CATALOG = [{"id": "composer-live-1", "label": "Composer Live 1"}]
 SETTINGS_CATALOG = [{"id": "settings-live-1", "label": "Settings Live 1"}]
 
@@ -911,6 +914,75 @@ def main() -> int:
         if not _wait_for_js(page, "() => !" + composer_pending_expr):
             raise AssertionError("pending isolation: composer pending key never cleared")
         print("OK  composer and Settings pending state are independent")
+
+        # --- Case 10: policy change never leaves the composer unpending ------
+        #
+        # #7404 review: _liveModelPolicyChanged() advances the global policy
+        # generation, which changes the composer's pending key. The replacement
+        # rebuild only re-registers that key after an asynchronous /api/models
+        # round-trip, so without a synchronous placeholder there is a window in
+        # which `has()` on the CURRENT composer key is false. syncTopbar() runs
+        # from boot/messages/commands/session-loads and defers a model correction
+        # only while that key is pending, so in that window it would persist a
+        # static fallback for a fetch whose live catalog may yet arrive (#1169).
+        #
+        # The assertion reads the composer key in the SAME tick as the
+        # chokepoint call, so it observes the transition itself rather than a
+        # later rebuild. Pre-fix the value is False (the gap); post-fix the
+        # synchronous retain makes it True.
+        page.evaluate(f"S.activeProfile = {PROFILE_POLICY_GAP!r}")
+        page.evaluate(f"window._activeProvider = {PROVIDER!r}")
+        stub.live_models = list(COMPOSER_CATALOG)
+        stub.hold_live = True
+        stub.held_routes = []
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("policy-gap: composer fetch was never held")
+        composer_key_expr = (
+            "_liveModelFetchKey("
+            f"{PROVIDER!r}, undefined, document.getElementById('modelSelect'))"
+        )
+        pending_in_change_tick = page.evaluate(
+            "() => {"
+            "  if (typeof _liveModelPolicyChanged === 'function') {"
+            "    _liveModelPolicyChanged();"
+            "  }"
+            "  return _liveModelFetchPending.has(" + composer_key_expr + ");"
+            "}"
+        )
+        if not pending_in_change_tick:
+            raise AssertionError(
+                "policy-gap: the composer pending entry vanished in the tick the "
+                "policy changed (`has()` on the current composer key was false); "
+                "a syncTopbar() in that window would persist a static fallback "
+                "for the in-flight live fetch"
+            )
+        # The replacement live fetch is held too; release every held route, then
+        # assert the composer key eventually clears. That proves the placeholder
+        # retained by the chokepoint is released on its settle path (no leak).
+        if not _wait_for_held_routes(stub, 2, page):
+            raise AssertionError(
+                "policy-gap: the replacement composer fetch was never held; "
+                f"held={len(stub.held_routes)} total={stub.live_request_count}"
+            )
+        while stub.held_routes:
+            stub.release_live(stub.held_routes.pop(0))
+        if not _wait_for_js(
+            page, "key => !_liveModelFetchPending.has(key)", composer_key_expr
+        ):
+            raise AssertionError(
+                "policy-gap: the composer pending key never cleared after the "
+                "replacement settled — the retained placeholder leaked"
+            )
+        print(
+            "OK  composer stayed pending in the policy-change tick and the "
+            "placeholder was released after settle"
+        )
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")

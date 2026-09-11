@@ -3616,19 +3616,53 @@ function _isLiveModelOwnerCurrent(token){
   return true;
 }
 function _liveModelPolicyChanged(){
+  // Best-effort by contract: this is a dropdown refresh, so nothing here may
+  // throw into the caller. saveSettings() wraps its call in a catch that treats
+  // a throw as "failed to update default model" and ABORTS the save, so an
+  // unexpected error while resolving the composer target must not escape.
+  let sel=null;
+  try{
+    sel=(typeof $==='function')?$('modelSelect'):null;
+  }catch(_e){
+    sel=null;
+  }
+  // Resolve the composer target and its provider BEFORE advancing so the
+  // placeholder below is retained under the replacement's own authority.
+  const provider=window._activeProvider||null;
   _liveModelAdvancePolicyGeneration();
+  // Gap-free transition: advancing the generation changes the composer's
+  // pending key, but the replacement rebuild only re-registers that key after
+  // an asynchronous /api/models round-trip. Retain a placeholder SYNCHRONOUSLY
+  // -- before any promise is created -- so `has()` on the current composer key
+  // is never false across the transition. syncTopbar() defers a model
+  // correction while that key is pending, so without this the in-flight live
+  // fetch window would persist a static fallback (#7404 review).
+  const retainedKey=_liveModelFetchKey(provider, undefined, sel);
+  _liveModelFetchRetain(retainedKey);
+  let released=false;
+  const release=()=>{
+    if(released) return;
+    released=true;
+    _liveModelFetchEnd(retainedKey);
+  };
   // A policy change invalidates any in-flight response. Start a replacement
   // request so the live catalog is not dropped: without this, advancing the
   // generation rejects the in-flight response and nothing re-fetches, leaving
-  // live-only models absent from the dropdown (#7404 review).
+  // live-only models absent from the dropdown (#7404 review). Fire-and-forget:
+  // callers must not await the rebuild. The placeholder is released on EVERY
+  // exit: the settled promise, the no-rebuild-available path, and the catch.
   try{
     if(typeof window._ensureModelDropdownReady==='function'){
       window._modelDropdownReady=null;
-      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
+      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{}).finally(release);
     }else if(typeof populateModelDropdown==='function'){
-      Promise.resolve(populateModelDropdown()).catch(()=>{});
+      Promise.resolve(populateModelDropdown()).catch(()=>{}).finally(release);
+    }else{
+      release();
     }
-  }catch(_e){}
+  }catch(_e){
+    release();
+  }
 }
 
 function _applySessionModelFallback(sel){
@@ -3824,6 +3858,15 @@ function _liveModelFetchEnd(key){
   const remaining=(_liveModelFetchPending.get(key)||0)-1;
   if(remaining>0)_liveModelFetchPending.set(key,remaining);
   else _liveModelFetchPending.delete(key);
+}
+// Retain an EXPLICIT key without owning a request. Used by
+// _liveModelPolicyChanged() to hold a placeholder across the async
+// advance-then-rebuild window so the composer never observes `has()===false`
+// between generations (#7404 review). The refcount overlaps the replacement
+// fetch's own begin/end; _liveModelFetchEnd() releases it.
+function _liveModelFetchRetain(key){
+  if(!key) return;
+  _liveModelFetchPending.set(key,(_liveModelFetchPending.get(key)||0)+1);
 }
 
 function _addLiveModelsToSelect(provider, models, sel){
