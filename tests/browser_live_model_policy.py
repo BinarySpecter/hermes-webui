@@ -72,6 +72,7 @@ PROFILE_INFLIGHT = "policy-profile-inflight"
 PROFILE_INFLIGHT_RACED = "policy-profile-inflight-raced"
 PROFILE_CONCURRENT = "policy-profile-concurrent"
 CONCURRENT_CATALOG = [{"id": "concurrent-live-1", "label": "Concurrent Live 1"}]
+PROFILE_SAME_PROFILE_RACE = "policy-profile-same-race"
 
 BENIGN = [
     "favicon",
@@ -510,6 +511,87 @@ def main() -> int:
                 "overlapping request completed; still pending"
             )
         print("OK  pending key cleared after the last overlapping request")
+
+        # --- Case 5: older broad response cannot win a same-profile race -------
+        #
+        # #7404 review blocking finding: response applicability was fenced only
+        # by the active profile (and an optional requestSeq). The Settings caller
+        # (`_fetchLiveModels(provider, modelSel)` with no requestSeq) is
+        # unowned, so an older broad-discovered response could reach the
+        # additive `_addLiveModelsToSelect()` AFTER a newer strict-pin refresh
+        # already applied, re-adding a model the strict policy excludes. The fix
+        # attaches an immutable owner token (profile + generation + select
+        # identity) to every request and rejects it before DOM mutation.
+        #
+        # Sequence is the maintainer's exact ordering:
+        #   broad-old held -> strict pin saved + refreshed -> release strict
+        #   first -> release broad last -> broad-only model must be absent.
+        page.evaluate(f"S.activeProfile = {PROFILE_SAME_PROFILE_RACE!r}")
+        stub.live_models = list(BROAD_DISCOVERED)
+        stub.hold_live = True
+        stub.held_routes = []
+        # Start the OLD broad request exactly the way loadSettingsPanel() does:
+        # no requestSeq, so the pre-fix code fences it on the profile alone.
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError(
+                "same-profile race: broad request was never held; "
+                f"held={len(stub.held_routes)} total={stub.live_request_count}"
+            )
+        broad_requests = stub.live_request_count
+
+        # Same-profile policy change through the production save-refresh path
+        # the provider key save (`_saveProviderKey`) invokes. This advances the
+        # live-model generation and starts the strict refresh (held below).
+        stub.live_models = list(STRICT_PIN)
+        page.evaluate("() => _refreshModelDropdownsAfterProviderChange()")
+        if not _wait_for_held_routes(stub, 2, page):
+            raise AssertionError(
+                "same-profile race: strict refresh was never held; "
+                f"held={len(stub.held_routes)} total={stub.live_request_count}"
+            )
+        if stub.live_request_count <= broad_requests:
+            raise AssertionError(
+                "same-profile race: the endpoint was not re-requested after the "
+                f"policy change; before={broad_requests} "
+                f"after={stub.live_request_count}"
+            )
+
+        # Release the STRICT (newer) response first and let it apply.
+        stub.release_live(stub.held_routes[1])
+        if not _wait_for_option(page, "strict-pin-1"):
+            raise AssertionError(
+                "same-profile race: strict pin was never applied after its "
+                f"response was released; options={_option_values(page)!r}"
+            )
+
+        # Release the BROAD (older) response last. Its stale token must be
+        # rejected so its broad-only model never lands.
+        stub.live_models = list(BROAD_DISCOVERED)
+        stub.release_live(stub.held_routes[0])
+        page.wait_for_timeout(300)
+        ids_after_race = _option_values(page)
+        if "strict-pin-1" not in ids_after_race:
+            raise AssertionError(
+                "same-profile race: strict pin disappeared after the stale broad "
+                f"response completed; options={ids_after_race!r}"
+            )
+        if "broad-live-1" in ids_after_race:
+            raise AssertionError(
+                "same-profile race: older broad-discovered response re-appended "
+                "'broad-live-1' after the newer strict result; "
+                f"options={ids_after_race!r}"
+            )
+        print(
+            "OK  older broad response rejected after newer strict result:",
+            ids_after_race,
+            f"(live requests {broad_requests}->{stub.live_request_count})",
+        )
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")

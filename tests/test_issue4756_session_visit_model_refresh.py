@@ -674,15 +674,18 @@ def test_populate_model_dropdown_accepts_session_visit_freshness_and_guards_stal
     # covers the remaining boundaries (entry, post-fetch, post-json).
     assert live_tail.count("requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq") >= 3
     # The removed cache also lost its "this cached payload is still current"
-    # protection, so the profile captured before the await must be re-verified
-    # before the response is applied (#7406).
-    assert "_fetchProfile" in live_tail, (
-        "_fetchLiveModels must capture the active profile before awaiting so a "
-        "mid-flight profile switch cannot apply the response (#7406)"
+    # protection, so the owner token captured before the await must be
+    # re-verified before the response is applied (#7406). The token subsumes the
+    # earlier profile-only re-check by capturing the active profile alongside the
+    # model-policy generation and the target select identity (#7404 review).
+    assert "_liveModelOwnerToken(provider, sel)" in live_tail, (
+        "_fetchLiveModels must capture an owner token (active profile + policy "
+        "generation + select identity) before awaiting so a mid-flight profile "
+        "switch or policy change cannot apply the response (#7406)"
     )
-    assert "_currentProfile!==_fetchProfile" in live_tail, (
-        "_fetchLiveModels must re-verify the captured profile before applying a "
-        "response to the DOM (#7406)"
+    assert live_tail.count("_isLiveModelOwnerCurrent(ownerToken)") >= 2, (
+        "_fetchLiveModels must re-verify the captured owner token before "
+        "mutating the DOM and before syncing the chip (#7406, #7404 review)"
     )
 
 

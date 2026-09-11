@@ -3561,6 +3561,47 @@ function _persistSessionModelCorrection(model, provider, opts){
 let _modelDropdownRequestSeq=0;
 let _modelCatalogFallbackRetried=false;
 
+// #7404 review: every live-model response is fenced by an immutable latest-owner
+// token. The active profile alone cannot distinguish two requests issued under
+// the same profile but different model policies (a broad discovered catalog vs
+// a strict pin) -- and `_addLiveModelsToSelect()` is additive, so a late broad
+// response would otherwise re-append a model the newer strict policy removed.
+// `generation` advances on same-profile policy saves and authoritative
+// dropdown/settings refreshes; `selectIdentity` advances whenever the target
+// <select> is authoritatively rebuilt. Both halves are read from live state at
+// check time (the select identity off the element itself, never a WeakMap), so
+// a stale request can neither mutate the list nor re-sync the chip.
+let _liveModelPolicyGeneration=0;
+function _liveModelAdvancePolicyGeneration(){
+  _liveModelPolicyGeneration++;
+}
+let _liveModelOwnerSeq=0;
+function _liveModelAdvanceSelectIdentity(sel){
+  if(!sel) return;
+  _liveModelOwnerSeq++;
+  sel.__liveModelOwnerSeq=_liveModelOwnerSeq;
+}
+function _liveModelOwnerToken(provider, sel){
+  return {
+    profile:(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default',
+    provider:String(provider||''),
+    generation:_liveModelPolicyGeneration,
+    selectIdentity:(sel&&typeof sel.__liveModelOwnerSeq==='number')?sel.__liveModelOwnerSeq:null,
+    sel:sel||null,
+  };
+}
+function _isLiveModelOwnerCurrent(token){
+  if(!token) return false;
+  const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
+  if(profile!==token.profile) return false;
+  if(_liveModelPolicyGeneration!==token.generation) return false;
+  if(token.sel){
+    const selectIdentity=(typeof token.sel.__liveModelOwnerSeq==='number')?token.sel.__liveModelOwnerSeq:null;
+    if(selectIdentity!==token.selectIdentity) return false;
+  }
+  return true;
+}
+
 function _applySessionModelFallback(sel){
   if(!sel) return null;
   const configuredDefault=String(window._defaultModel||'').trim();
@@ -3656,6 +3697,12 @@ async function populateModelDropdown(opts={}){
       return; // no server groups and no configured fallback
     }
     const previousSelection=_captureModelDropdownSelection(sel);
+    // Authoritative rebuild of this select: bump the policy generation and the
+    // select's owner identity so any live-model response captured before this
+    // render (under a now-superseded policy) is rejected before it can mutate
+    // the fresh list.
+    _liveModelAdvancePolicyGeneration();
+    _liveModelAdvanceSelectIdentity(sel);
     // Clear existing options
     sel.innerHTML='';
     _dynamicModelLabels={};
@@ -3725,18 +3772,22 @@ async function populateModelDropdown(opts={}){
 // discovered catalog after the same profile switched to a strict model pin and
 // never reach the policy-aware server cache (#7404 review). Always fetch.
 //
-// Tracks profile+provider pairs with a live-model fetch in flight. Keyed by the
-// same authority as the request so a pending fetch for one profile cannot
-// suppress another profile's fetch. Used by syncTopbar() to defer model
-// corrections until the fetch completes, preventing premature fallback to the
-// first static model (#1169).
+// Tracks profile+provider+policy-generation triples with a live-model fetch in
+// flight. Keyed by the same authority as the request so a pending fetch for one
+// profile/generation cannot suppress another's (and so an older generation's
+// completion decrements its own counter, never a newer generation's). Used by
+// syncTopbar() to defer model corrections until the fetch completes, preventing
+// premature fallback to the first static model (#1169). Calling this without an
+// explicit generation resolves to the CURRENT generation, so `has()` there still
+// means "at least one in-flight request for the current authority".
 const _liveModelFetchPending=new Map();
-function _liveModelFetchKey(provider){
+function _liveModelFetchKey(provider, generation){
   const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
-  return profile+'\u0000'+String(provider||'');
+  const policyGeneration=(typeof generation==='number')?generation:_liveModelPolicyGeneration;
+  return profile+'\u0000'+String(provider||'')+'\u0000'+String(policyGeneration);
 }
-function _liveModelFetchBegin(provider){
-  const key=_liveModelFetchKey(provider);
+function _liveModelFetchBegin(provider, ownerToken){
+  const key=_liveModelFetchKey(provider, ownerToken?ownerToken.generation:undefined);
   _liveModelFetchPending.set(key,(_liveModelFetchPending.get(key)||0)+1);
   return key;
 }
@@ -3848,10 +3899,11 @@ function _addLiveModelsToSelect(provider, models, sel){
 async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
   if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
-  // Capture the profile at fetch start so a mid-flight profile switch cannot
-  // apply this catalog to a different profile's dropdown.
-  const _fetchProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
-  const fetchKey=_liveModelFetchBegin(provider);
+  // Capture an immutable latest-owner token at fetch start: active profile,
+  // provider, model-policy generation, and target-select identity. See
+  // _isLiveModelOwnerCurrent() for the full staleness contract.
+  const ownerToken=_liveModelOwnerToken(provider, sel);
+  const fetchKey=_liveModelFetchBegin(provider, ownerToken);
   try{
     const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
@@ -3861,12 +3913,14 @@ async function _fetchLiveModels(provider, sel, requestSeq=null){
     const data=await _liveRes.json();
     if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
     if(!data.models||!data.models.length) return;
-    // Re-verify the profile captured before the await: if the active profile
-    // changed mid-flight this catalog no longer belongs to the current view.
-    const _currentProfile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
-    if(_currentProfile!==_fetchProfile) return;
+    // Require the captured owner token to remain current before any UI
+    // mutation. A profile switch, a newer policy save/refresh, or a rebuilt
+    // target select all invalidate it -- the last one is what stops an older
+    // broad response from being appended after a newer strict result.
+    if(!_isLiveModelOwnerCurrent(ownerToken)) return;
     const added=_addLiveModelsToSelect(provider,data.models,sel);
     if(added>0){
+      if(!_isLiveModelOwnerCurrent(ownerToken)) return;
       if(typeof syncModelChip==='function') syncModelChip();
       console.debug('[hermes] Live models loaded for',provider+':',added,'new models added');
     }

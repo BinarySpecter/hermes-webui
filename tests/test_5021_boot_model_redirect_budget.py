@@ -206,6 +206,15 @@ function installGlobals(select, redirects, fetchQueue, jsonCalls) {
   globalThis._refreshOpenModelDropdown = () => {};
   globalThis._modelDropdownRequestSeq = 0;
   globalThis._fetchLiveModels = () => {};
+  // Mirror the production latest-owner helpers populateModelDropdown() now calls
+  // (#7404 review). _fetchLiveModels is stubbed above, so only the generation
+  // and select-identity advances are needed here.
+  globalThis._liveModelPolicyGeneration = 0;
+  globalThis._liveModelAdvancePolicyGeneration = () => { globalThis._liveModelPolicyGeneration++; };
+  globalThis._liveModelAdvanceSelectIdentity = (sel) => {
+    if (!sel) return;
+    sel.__liveModelOwnerSeq = (typeof sel.__liveModelOwnerSeq === 'number' ? sel.__liveModelOwnerSeq : 0) + 1;
+  };
   globalThis.console = { warn() {}, debug() {}, log() {} };
   globalThis.fetch = async () => {
     if (!fetchQueue.length) throw new Error('unexpected fetch');
