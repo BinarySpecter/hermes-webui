@@ -3619,49 +3619,90 @@ function _liveModelPolicyChanged(){
   // Best-effort by contract: this is a dropdown refresh, so nothing here may
   // throw into the caller. saveSettings() wraps its call in a catch that treats
   // a throw as "failed to update default model" and ABORTS the save, so an
-  // unexpected error while resolving the composer target must not escape.
-  let sel=null;
+  // unexpected error while resolving either target must not escape.
+  //
+  // There are exactly TWO live-model targets in this codebase: the composer
+  // (`modelSelect`) and Settings -> Default Model (`settingsModel`). A genuine
+  // policy change invalidates in-flight responses for BOTH, so the replacement
+  // must cover both as well; starting one only for the composer leaves the
+  // Settings picker without its live-only models (#7404 review).
+  let composerSel=null;
+  let settingsSel=null;
   try{
-    sel=(typeof $==='function')?$('modelSelect'):null;
+    composerSel=(typeof $==='function')?$('modelSelect'):null;
+    settingsSel=(typeof $==='function')?$('settingsModel'):null;
   }catch(_e){
-    sel=null;
+    composerSel=null;
+    settingsSel=null;
   }
-  // Resolve the composer target and its provider BEFORE advancing so the
-  // placeholder below is retained under the replacement's own authority.
+  // Resolve the provider BEFORE advancing so both placeholders below are
+  // retained under the replacement's own authority.
   const provider=window._activeProvider||null;
+  // The global policy generation is real policy authority: advance it ONCE.
   _liveModelAdvancePolicyGeneration();
-  // Gap-free transition: advancing the generation changes the composer's
-  // pending key, but the replacement rebuild only re-registers that key after
-  // an asynchronous /api/models round-trip. Retain a placeholder SYNCHRONOUSLY
-  // -- before any promise is created -- so `has()` on the current composer key
-  // is never false across the transition. syncTopbar() defers a model
-  // correction while that key is pending, so without this the in-flight live
-  // fetch window would persist a static fallback (#7404 review).
-  const retainedKey=_liveModelFetchKey(provider, undefined, sel);
-  _liveModelFetchRetain(retainedKey);
-  let released=false;
-  const release=()=>{
-    if(released) return;
-    released=true;
-    _liveModelFetchEnd(retainedKey);
+  // Gap-free transition for the COMPOSER: advancing the generation changes the
+  // composer's pending key, but the replacement rebuild only re-registers that
+  // key after an asynchronous /api/models round-trip. Retain a placeholder
+  // SYNCHRONOUSLY -- before any promise is created -- so `has()` on the current
+  // composer key is never false across the transition. syncTopbar() defers a
+  // model correction while that key is pending, so without this the in-flight
+  // live fetch window would persist a static fallback (#7404 review).
+  const composerRetainedKey=_liveModelFetchKey(provider, undefined, composerSel);
+  _liveModelFetchRetain(composerRetainedKey);
+  let composerReleased=false;
+  const releaseComposer=()=>{
+    if(composerReleased) return;
+    composerReleased=true;
+    _liveModelFetchEnd(composerRetainedKey);
   };
+  // The SETTINGS select is an independent publisher with its own per-target
+  // identity, so it gets its own placeholder under the SAME key function and a
+  // replacement through the SHARED rebuild. Retained synchronously here for the
+  // same gap-free reason as the composer; release() is idempotent so overlap
+  // decrements the refcount once.
+  let settingsRetainedKey=null;
+  let settingsReleased=true;
+  const releaseSettings=()=>{
+    if(settingsReleased) return;
+    settingsReleased=true;
+    _liveModelFetchEnd(settingsRetainedKey);
+  };
+  if(settingsSel){
+    settingsRetainedKey=_liveModelFetchKey(provider, undefined, settingsSel);
+    _liveModelFetchRetain(settingsRetainedKey);
+    settingsReleased=false;
+  }
   // A policy change invalidates any in-flight response. Start a replacement
-  // request so the live catalog is not dropped: without this, advancing the
-  // generation rejects the in-flight response and nothing re-fetches, leaving
-  // live-only models absent from the dropdown (#7404 review). Fire-and-forget:
-  // callers must not await the rebuild. The placeholder is released on EVERY
-  // exit: the settled promise, the no-rebuild-available path, and the catch.
+  // request for the composer so its live catalog is not dropped. Fire-and-
+  // forget: callers must not await the rebuild. The placeholder is released on
+  // EVERY exit: the settled promise, the no-rebuild-available path, and the
+  // catch.
   try{
     if(typeof window._ensureModelDropdownReady==='function'){
       window._modelDropdownReady=null;
-      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{}).finally(release);
+      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{}).finally(releaseComposer);
     }else if(typeof populateModelDropdown==='function'){
-      Promise.resolve(populateModelDropdown()).catch(()=>{}).finally(release);
+      Promise.resolve(populateModelDropdown()).catch(()=>{}).finally(releaseComposer);
     }else{
-      release();
+      releaseComposer();
     }
   }catch(_e){
-    release();
+    releaseComposer();
+  }
+  // Symmetric replacement for the SETTINGS target. Route through the shared
+  // `_rebuildSettingsModelSelect()` so both call sites have ONE implementation.
+  // That helper clears the select first, so this REPLACES the live catalog; a
+  // bare `_fetchLiveModels()` re-append would accumulate entries on every
+  // policy save. Guarded so a missing panels.js helper cannot throw into
+  // saveSettings().
+  try{
+    if(typeof window._rebuildSettingsModelSelect==='function'){
+      Promise.resolve(window._rebuildSettingsModelSelect()).catch(()=>{}).finally(releaseSettings);
+    }else{
+      releaseSettings();
+    }
+  }catch(_e){
+    releaseSettings();
   }
 }
 

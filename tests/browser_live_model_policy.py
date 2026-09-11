@@ -96,6 +96,14 @@ PROFILE_TARGET_PENDING = "policy-profile-target-pending"
 PROFILE_POLICY_GAP = "policy-profile-gap"
 COMPOSER_CATALOG = [{"id": "composer-live-1", "label": "Composer Live 1"}]
 SETTINGS_CATALOG = [{"id": "settings-live-1", "label": "Settings Live 1"}]
+# #7404 review P1 (Settings target): a settingsModel live request in flight when
+# a changed default model is saved is invalidated by the global generation
+# advance; the replacement must rebuild the Settings picker, not just the
+# composer, or live-only models vanish from Settings until the panel is rebuilt.
+PROFILE_SETTINGS_POLICY = "policy-profile-settings-save"
+SETTINGS_BEFORE_CATALOG = [{"id": "settings-before-1", "label": "Settings Before 1"}]
+SETTINGS_AFTER_CATALOG = [{"id": "settings-after-1", "label": "Settings After 1"}]
+SETTINGS_AFTER_CATALOG_2 = [{"id": "settings-after-2", "label": "Settings After 2"}]
 
 BENIGN = [
     "favicon",
@@ -705,7 +713,12 @@ def main() -> int:
         # live-model generation and starts the strict refresh (held below).
         stub.live_models = list(STRICT_PIN)
         page.evaluate("() => _refreshModelDropdownsAfterProviderChange()")
-        if not _wait_for_held_routes(stub, 2, page):
+        # A policy change now drives BOTH live-model targets, so collect both
+        # replacements before releasing them. Pre-fix (Settings target absent)
+        # only the composer replacement exists; the wait is best-effort and the
+        # assertions below are authoritative.
+        _wait_for_held_routes(stub, 3, page, timeout=4000)
+        if len(stub.held_routes) < 2:
             raise AssertionError(
                 "same-profile race: strict refresh was never held; "
                 f"held={len(stub.held_routes)} total={stub.live_request_count}"
@@ -717,8 +730,10 @@ def main() -> int:
                 f"after={stub.live_request_count}"
             )
 
-        # Release the STRICT (newer) response first and let it apply.
-        stub.release_live(stub.held_routes[1])
+        # Release the STRICT (newer) replacements first and let them apply. All
+        # routes after index 0 are replacements (composer and/or Settings).
+        for _route in stub.held_routes[1:]:
+            stub.release_live(_route)
         if not _wait_for_option(page, "strict-pin-1"):
             raise AssertionError(
                 "same-profile race: strict pin was never applied after its "
@@ -795,13 +810,16 @@ def main() -> int:
             "}"
         )
 
-        # Wait for the replacement request. Pre-fix none is issued, so this
-        # returns False after the timeout and the stale response below is still
-        # released to prove the invalidation half.
-        replacement_held = _wait_for_held_routes(stub, 2, page)
+        # Wait for the replacements (composer and/or Settings). Pre-fix none is
+        # issued, so this returns False after the timeout and the stale response
+        # below is still released to prove the invalidation half.
+        replacement_held = _wait_for_held_routes(stub, 2, page, timeout=4000)
         if replacement_held:
-            # Release the replacement (newer) response first and let it apply.
-            stub.release_live(stub.held_routes[1])
+            # Give BOTH targets' replacements a chance to arrive before draining
+            # them all with the post-save catalog.
+            _wait_for_held_routes(stub, 3, page, timeout=2000)
+            for _route in stub.held_routes[1:]:
+                stub.release_live(_route)
             _wait_for_option(page, "after-policy-live-1")
 
         # Release the held broad (older, now stale) response LAST. Its stale
@@ -970,6 +988,9 @@ def main() -> int:
                 "policy-gap: the replacement composer fetch was never held; "
                 f"held={len(stub.held_routes)} total={stub.live_request_count}"
             )
+        # Give the Settings replacement (now also driven by the chokepoint) a
+        # chance to arrive too, then drain every held route.
+        _wait_for_held_routes(stub, 3, page, timeout=2000)
         while stub.held_routes:
             stub.release_live(stub.held_routes.pop(0))
         if not _wait_for_js(
@@ -983,6 +1004,140 @@ def main() -> int:
             "OK  composer stayed pending in the policy-change tick and the "
             "placeholder was released after settle"
         )
+
+        # --- Case 11: Settings replacement on a policy change (new P1) --------
+        #
+        # Greptile P1: when a settingsModel live request is still in flight as
+        # the user saves a changed default model, _liveModelPolicyChanged()
+        # invalidated that response globally but started a replacement only for
+        # modelSelect, leaving live-only models absent from the Settings picker
+        # until it was rebuilt. This drives the real Settings open path
+        # (loadSettingsPanel) and the real policy chokepoint, then requires the
+        # Settings picker to end up with the replacement's live-only catalog.
+        #
+        # The second half is the no-accumulation guarantee: a second policy save
+        # must REPLACE the Settings live catalog. A bare _fetchLiveModels()
+        # re-append (no innerHTML clear) would leave the previous policy's
+        # live-only model behind, so the stale-model assertion has teeth.
+        while stub.held_routes:
+            stub.release_live(stub.held_routes.pop(0))
+        page.wait_for_timeout(50)
+        page.evaluate(f"S.activeProfile = {PROFILE_SETTINGS_POLICY!r}")
+        stub.live_models = list(SETTINGS_BEFORE_CATALOG)
+        stub.hold_live = True
+        stub.held_routes = []
+        # Open Settings through its production loader so settingsModel is
+        # populated and its live request is in flight under the pre-save policy.
+        page.evaluate("void loadSettingsPanel()")
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("settings-policy: the Settings live fetch was never held")
+        stale_settings_route = stub.held_routes[0]
+        requests_before = stub.live_request_count
+
+        # A changed default-model save through the production chokepoint.
+        stub.live_models = list(SETTINGS_AFTER_CATALOG)
+        page.evaluate(
+            "() => {"
+            "  if (typeof _liveModelPolicyChanged === 'function') {"
+            "    _liveModelPolicyChanged();"
+            "  }"
+            "}"
+        )
+        # Give the replacements (composer + Settings) a chance to be issued.
+        # Deliberately do NOT fail here: a pre-fix run must fail on the missing
+        # Settings catalog below, not on a missing request symbol.
+        _wait_for_held_routes(stub, 3, page, timeout=3000)
+        # The held pre-save Settings response is now stale; its generation is
+        # gone, so releasing it must NOT append its catalog.
+        stub.live_models = list(SETTINGS_BEFORE_CATALOG)
+        stub.release_live(stale_settings_route)
+        # Every replacement carries the post-save catalog.
+        stub.live_models = list(SETTINGS_AFTER_CATALOG)
+        for route in list(stub.held_routes):
+            if route is stale_settings_route:
+                continue
+            stub.release_live(route)
+        stub.held_routes = []
+
+        if not _wait_for_settings_option(page, "settings-after-1"):
+            raise AssertionError(
+                "settings-policy dropped the live catalog: after the policy change "
+                "the in-flight Settings response was rejected and no replacement "
+                "live models ever landed, so live-only models are MISSING from the "
+                f"Settings picker; settings options={_settings_option_values(page)!r}; "
+                f"requests before={requests_before} after={stub.live_request_count}"
+            )
+        settings_ids = _settings_option_values(page)
+        if "settings-before-1" in settings_ids:
+            raise AssertionError(
+                "settings-policy: the stale pre-save Settings response was applied "
+                f"after the policy change; settings options={settings_ids!r}"
+            )
+        if settings_ids.count("settings-after-1") != 1:
+            raise AssertionError(
+                "settings-policy duplicated the replacement's live model; "
+                f"settings options={settings_ids!r}"
+            )
+        # The composer replacement is released with the same catalog; proving it
+        # also published shows the chokepoint drives BOTH targets, not one.
+        if not _wait_for_option(page, "settings-after-1"):
+            raise AssertionError(
+                "settings-policy: the composer replacement did not publish while "
+                f"Settings was rebuilt; composer options={_option_values(page)!r}"
+            )
+        print(
+            "OK  Settings policy change invalidated the in-flight response AND "
+            "restored the Settings live catalog:",
+            settings_ids,
+            f"(live requests {requests_before}->{stub.live_request_count})",
+        )
+
+        # Second policy save: the Settings rebuild must clear the previous live
+        # catalog rather than accumulate it.
+        while stub.held_routes:
+            stub.release_live(stub.held_routes.pop(0))
+        stub.held_routes = []
+        stub.live_models = list(SETTINGS_AFTER_CATALOG_2)
+        page.evaluate(
+            "() => {"
+            "  if (typeof _liveModelPolicyChanged === 'function') {"
+            "    _liveModelPolicyChanged();"
+            "  }"
+            "}"
+        )
+        _wait_for_held_routes(stub, 2, page, timeout=3000)
+        for route in list(stub.held_routes):
+            stub.release_live(route)
+        stub.held_routes = []
+        if not _wait_for_settings_option(page, "settings-after-2"):
+            raise AssertionError(
+                "settings-policy: the second policy change did not publish its "
+                f"live catalog; settings options={_settings_option_values(page)!r}"
+            )
+        settings_ids = _settings_option_values(page)
+        if "settings-after-1" in settings_ids:
+            raise AssertionError(
+                "settings-policy accumulated the previous policy's live model "
+                "instead of replacing it (bare re-append, no innerHTML clear); "
+                f"settings options={settings_ids!r}"
+            )
+        if settings_ids.count("settings-after-2") != 1:
+            raise AssertionError(
+                "settings-policy duplicated the second replacement's live model; "
+                f"settings options={settings_ids!r}"
+            )
+        print(
+            "OK  second Settings policy save replaced (did not accumulate) the "
+            "live catalog:",
+            settings_ids,
+        )
+
+        # Drain any still-held live routes so browser.close() does not abort
+        # them (an intercepted-but-unreleased route surfaces as a Playwright
+        # teardown traceback even when the gate itself passed).
+        while stub.held_routes:
+            stub.release_live(stub.held_routes.pop(0))
+        page.wait_for_timeout(100)
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")

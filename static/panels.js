@@ -9033,6 +9033,69 @@ function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
     : 'No override';
 }
 
+// Authoritative rebuild of the Settings -> Default Model select (#872).
+//
+// Shared by loadSettingsPanel() (panel open) and _liveModelPolicyChanged()
+// (default-model save / provider add-remove-refresh) so this target has ONE
+// implementation. The chokepoint used to know only about the composer, so a
+// policy change invalidated an in-flight Settings live fetch without starting
+// a replacement -- the Settings picker then lost its live-only models until the
+// panel was next rebuilt (#7404 review).
+//
+// Advances ONLY the Settings select's per-target latest-request sequence, never
+// the global policy generation: the composer is an independent publisher, so a
+// Settings rebuild must not invalidate an in-flight composer live-model request
+// (nor vice versa). Clears innerHTML before repopulating, so a replacement
+// REPLACES the live catalog instead of accumulating entries across policy saves.
+async function _rebuildSettingsModelSelect(){
+  const modelSel=$('settingsModel');
+  // Settings never opened -- nothing to rebuild, and no throw for the caller.
+  if(!modelSel) return null;
+  if(typeof _liveModelAdvanceSelectIdentity==='function') _liveModelAdvanceSelectIdentity(modelSel);
+  modelSel.innerHTML='';
+  let models=null;
+  try{
+    models=await api('/api/models');
+    for(const g of ((models||{}).groups||[])){
+      const og=document.createElement('optgroup');
+      og.label=g.provider;
+      if(g.provider_id) og.dataset.provider=g.provider_id;
+      for(const m of [...(g.models||[]),...(g.extra_models||[])]){
+        const opt=document.createElement('option');
+        opt.value=m.id;opt.textContent=m.label;
+        if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
+          opt.dataset.fast='1';
+        }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
+          opt.dataset.fast='0';
+        }
+        og.appendChild(opt);
+      }
+      modelSel.appendChild(og);
+    }
+    // Append live-fetched models for the active provider, same as the
+    // chat-header dropdown does via _fetchLiveModels() (#872).
+    if(models.active_provider && typeof _fetchLiveModels==='function'){
+      _fetchLiveModels(models.active_provider, modelSel);
+    }
+  }catch(e){}
+  _settingsHermesDefaultModelOnOpen=(models&&models.default_model)||'';
+  _settingsHermesDefaultModelProviderOnOpen=(models&&models.active_provider)||null;
+  // Use the smart matcher so a saved bare form like "anthropic/claude-opus-4.6"
+  // (what the CLI's `hermes model` command writes) still selects the matching
+  // `@nous:anthropic/claude-opus-4.6` option on a Nous setup. Without this, the
+  // picker renders blank for any user whose default was persisted without the
+  // @-prefix — CLI-first users, legacy installs, etc.
+  if(typeof _applyModelToDropdown==='function'){
+    _applyModelToDropdown(_settingsHermesDefaultModelOnOpen, modelSel, (models&&models.active_provider)||window._activeProvider||null);
+  }else{
+    modelSel.value=_settingsHermesDefaultModelOnOpen;
+  }
+  if(typeof closeSettingsModelDropdown==='function') closeSettingsModelDropdown();
+  if(typeof mountSettingsModelPicker==='function') mountSettingsModelPicker();
+  return models;
+}
+if(typeof window!=='undefined') window._rebuildSettingsModelSelect=_rebuildSettingsModelSelect;
+
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
@@ -9264,55 +9327,9 @@ async function loadSettingsPanel(){
     // Populate model dropdown from /api/models + live model fetch (#872)
     const modelSel=$('settingsModel');
     if(modelSel){
-      // #7404 review: this is an authoritative rebuild of the Settings select
-      // ONLY. Advance ITS per-target latest-request sequence, never the global
-      // policy generation: the composer is an independent publisher, so a
-      // Settings rebuild must not invalidate a composer live-model request that
-      // is already in flight (nor vice versa). The unrequestSeq'd
-      // _fetchLiveModels() call below starts its own replacement for
-      // settingsModel, so do NOT route through _liveModelPolicyChanged() (that
-      // drives the composer and would double-fetch here).
-      if(typeof _liveModelAdvanceSelectIdentity==='function') _liveModelAdvanceSelectIdentity(modelSel);
-      modelSel.innerHTML='';
-      let models=null;
-      try{
-        models=await api('/api/models');
-        for(const g of ((models||{}).groups||[])){
-          const og=document.createElement('optgroup');
-          og.label=g.provider;
-          if(g.provider_id) og.dataset.provider=g.provider_id;
-          for(const m of [...(g.models||[]),...(g.extra_models||[])]){
-            const opt=document.createElement('option');
-            opt.value=m.id;opt.textContent=m.label;
-            if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
-              opt.dataset.fast='1';
-            }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
-              opt.dataset.fast='0';
-            }
-            og.appendChild(opt);
-          }
-          modelSel.appendChild(og);
-        }
-        // Append live-fetched models for the active provider, same as the
-        // chat-header dropdown does via _fetchLiveModels() (#872).
-        if(models.active_provider && typeof _fetchLiveModels==='function'){
-          _fetchLiveModels(models.active_provider, modelSel);
-        }
-      }catch(e){}
-      _settingsHermesDefaultModelOnOpen=(models&&models.default_model)||'';
-      _settingsHermesDefaultModelProviderOnOpen=(models&&models.active_provider)||null;
-      // Use the smart matcher so a saved bare form like "anthropic/claude-opus-4.6"
-      // (what the CLI's `hermes model` command writes) still selects the matching
-      // `@nous:anthropic/claude-opus-4.6` option on a Nous setup. Without this, the
-      // picker renders blank for any user whose default was persisted without the
-      // @-prefix — CLI-first users, legacy installs, etc.
-      if(typeof _applyModelToDropdown==='function'){
-        _applyModelToDropdown(_settingsHermesDefaultModelOnOpen, modelSel, (models&&models.active_provider)||window._activeProvider||null);
-      }else{
-        modelSel.value=_settingsHermesDefaultModelOnOpen;
-      }
-      if(typeof closeSettingsModelDropdown==='function') closeSettingsModelDropdown();
-      if(typeof mountSettingsModelPicker==='function') mountSettingsModelPicker();
+      // Shared rebuild -- the same chokepoint `_liveModelPolicyChanged()`
+      // drives, so this target has ONE implementation (#7404 review).
+      await _rebuildSettingsModelSelect();
       modelSel.addEventListener('change',_markSettingsDirty,{once:false});
       if(!modelSel._settingsChipSyncBound){
         modelSel._settingsChipSyncBound=true;
