@@ -73,6 +73,11 @@ PROFILE_INFLIGHT_RACED = "policy-profile-inflight-raced"
 PROFILE_CONCURRENT = "policy-profile-concurrent"
 CONCURRENT_CATALOG = [{"id": "concurrent-live-1", "label": "Concurrent Live 1"}]
 PROFILE_SAME_PROFILE_RACE = "policy-profile-same-race"
+# #7404 review P1 regression: advancing the policy generation without starting a
+# replacement request drops the live catalog. Distinct catalog so the
+# replacement's models are distinguishable from the held broad response's.
+PROFILE_SAVE_POLICY = "policy-profile-save"
+AFTER_POLICY_CATALOG = [{"id": "after-policy-live-1", "label": "After Policy Live 1"}]
 
 BENIGN = [
     "favicon",
@@ -174,9 +179,10 @@ def _wait_for_held_routes(stub: "LiveModelStub", count: int, page, timeout: floa
 
     Uses ``page.wait_for_timeout`` so each iteration advances Playwright's event
     loop (which is what actually dispatches route handlers); a Python
-    ``time.sleep`` would deadlock the interception.
+    ``time.sleep`` would deadlock the interception. ``timeout`` is in
+    milliseconds, matching the other helpers and Playwright's own API.
     """
-    deadline = time.time() + timeout
+    deadline = time.time() + timeout / 1000.0
     while len(stub.held_routes) < count:
         if time.time() > deadline:
             return False
@@ -591,6 +597,102 @@ def main() -> int:
             "OK  older broad response rejected after newer strict result:",
             ids_after_race,
             f"(live requests {broad_requests}->{stub.live_request_count})",
+        )
+
+        # --- Case 6: saveSettings policy change invalidates AND re-requests ----
+        #
+        # #7404 review P1: saveSettings() advanced the live-model policy
+        # generation on a changed default-model save but started no replacement
+        # request. The in-flight live-model response was then rejected as stale,
+        # so live-only models silently disappeared from the dropdown. The fix
+        # routes both save branches through _liveModelPolicyChanged(), which
+        # BOTH invalidates the in-flight response AND starts a replacement.
+        #
+        # This case drives that production chokepoint. Pre-fix the symbol does
+        # not exist, so fall back to the real pre-fix helper (advance only),
+        # which reproduces the dropped-catalog defect without a missing-symbol
+        # error.
+        page.evaluate(f"S.activeProfile = {PROFILE_SAVE_POLICY!r}")
+        stub.live_models = list(BROAD_DISCOVERED)
+        stub.hold_live = True
+        stub.held_routes = []
+        # In-flight request captured under the pre-save policy (the Settings open
+        # path starts one with an unrequestSeq'd _fetchLiveModels call). Held so
+        # it arrives AFTER the save's policy change.
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError(
+                "save-policy: in-flight broad request was never held; "
+                f"held={len(stub.held_routes)} total={stub.live_request_count}"
+            )
+        requests_before_save = stub.live_request_count
+
+        # The replacement request will carry this catalog. Responses are
+        # generated at release time, so the held broad route is re-armed with
+        # BROAD_DISCOVERED again just before it is released below.
+        stub.live_models = list(AFTER_POLICY_CATALOG)
+        page.evaluate(
+            "() => {"
+            "  if (typeof _liveModelPolicyChanged === 'function') {"
+            "    _liveModelPolicyChanged();"
+            "  } else if (typeof _liveModelAdvancePolicyGeneration === 'function') {"
+            "    _liveModelAdvancePolicyGeneration();"
+            "  }"
+            "}"
+        )
+
+        # Wait for the replacement request. Pre-fix none is issued, so this
+        # returns False after the timeout and the stale response below is still
+        # released to prove the invalidation half.
+        replacement_held = _wait_for_held_routes(stub, 2, page)
+        if replacement_held:
+            # Release the replacement (newer) response first and let it apply.
+            stub.release_live(stub.held_routes[1])
+            _wait_for_option(page, "after-policy-live-1")
+
+        # Release the held broad (older, now stale) response LAST. Its stale
+        # token must be rejected so its broad-only model never lands.
+        stub.live_models = list(BROAD_DISCOVERED)
+        stub.release_live(stub.held_routes[0])
+        page.wait_for_timeout(300)
+        ids_after_save = _option_values(page)
+
+        # Half 1 (stale rejected).
+        if "broad-live-1" in ids_after_save:
+            raise AssertionError(
+                "save-policy: the stale in-flight broad response re-appended "
+                f"'broad-live-1' after the policy change; options={ids_after_save!r}"
+            )
+        # Half 2 (catalog not dropped). Assert the live models are present
+        # BEFORE the request-count check so the pre-fix failure reports the
+        # dropped catalog (missing models), not merely a missing call.
+        if "after-policy-live-1" not in ids_after_save:
+            raise AssertionError(
+                "save-policy dropped the live catalog: after the policy change "
+                "the in-flight response was rejected and no replacement live "
+                "models ever landed, so live-only models are MISSING from the "
+                f"dropdown; options={ids_after_save!r}; "
+                f"requests before={requests_before_save} "
+                f"after={stub.live_request_count}; "
+                f"replacement_held={replacement_held}"
+            )
+        if stub.live_request_count <= requests_before_save:
+            raise AssertionError(
+                "save-policy: the policy change did not re-request "
+                f"/api/models/live; before={requests_before_save} "
+                f"after={stub.live_request_count}"
+            )
+        print(
+            "OK  saveSettings policy change invalidated the in-flight response "
+            "AND restored the live catalog:",
+            ids_after_save,
+            f"(live requests {requests_before_save}->{stub.live_request_count}, "
+            f"replacement_held={replacement_held})",
         )
 
         if errors:

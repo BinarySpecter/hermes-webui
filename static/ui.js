@@ -3601,6 +3601,21 @@ function _isLiveModelOwnerCurrent(token){
   }
   return true;
 }
+function _liveModelPolicyChanged(){
+  _liveModelAdvancePolicyGeneration();
+  // A policy change invalidates any in-flight response. Start a replacement
+  // request so the live catalog is not dropped: without this, advancing the
+  // generation rejects the in-flight response and nothing re-fetches, leaving
+  // live-only models absent from the dropdown (#7404 review).
+  try{
+    if(typeof window._ensureModelDropdownReady==='function'){
+      window._modelDropdownReady=null;
+      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
+    }else if(typeof populateModelDropdown==='function'){
+      Promise.resolve(populateModelDropdown()).catch(()=>{});
+    }
+  }catch(_e){}
+}
 
 function _applySessionModelFallback(sel){
   if(!sel) return null;

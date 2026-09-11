@@ -9268,7 +9268,8 @@ async function loadSettingsPanel(){
       // policy generation and this select's owner identity before the
       // unrequestSeq'd _fetchLiveModels() call below so a live response held
       // from a previous settings open cannot append stale models to the
-      // rebuilt list.
+      // rebuilt list. Starts its own replacement fetch below, so do NOT route
+      // through _liveModelPolicyChanged() (that would double-fetch).
       if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
       if(typeof _liveModelAdvanceSelectIdentity==='function') _liveModelAdvanceSelectIdentity(modelSel);
       modelSel.innerHTML='';
@@ -11883,7 +11884,9 @@ function _refreshModelDropdownsAfterProviderChange(){
   try{
     // #7404 review: a provider add/remove/refresh is an authoritative policy
     // change, so advance the live-model generation. Any in-flight response for
-    // the previous provider policy is rejected at apply time.
+    // the previous provider policy is rejected at apply time. Already starts a
+    // replacement rebuild below, so do NOT route through
+    // _liveModelPolicyChanged() (that would double-fetch).
     if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
     if(typeof window._invalidateSlashModelCache==='function'){
       window._invalidateSlashModelCache();
@@ -12868,8 +12871,9 @@ async function saveSettings(andClose){
         body.default_model_provider=(modelState&&modelState.model===model)?(modelState.model_provider||null):null;
         // #7404 review: the model policy changed for the same profile. Advance
         // the live-model generation so any in-flight broad-discovered response
-        // is rejected before it can re-append a model the new pin excludes.
-        if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
+        // is rejected before it can re-append a model the new pin excludes, and
+        // start a replacement request so the live catalog is not dropped.
+        if(typeof _liveModelPolicyChanged==='function') _liveModelPolicyChanged();
         }catch(_modelErr){
           // A 400 here (e.g. an ambiguous custom-provider slug collision: rename
           // one provider) is user-fixable, not a partial success. Surface the
@@ -12908,8 +12912,9 @@ async function saveSettings(andClose){
         body.default_model_provider=(modelState&&modelState.model===model)?(modelState.model_provider||null):null;
         // #7404 review: the model policy changed for the same profile. Advance
         // the live-model generation so any in-flight broad-discovered response
-        // is rejected before it can re-append a model the new pin excludes.
-        if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
+        // is rejected before it can re-append a model the new pin excludes, and
+        // start a replacement request so the live catalog is not dropped.
+        if(typeof _liveModelPolicyChanged==='function') _liveModelPolicyChanged();
         }catch(_modelErr){
           // A 400 here (e.g. an ambiguous custom-provider slug collision: rename
           // one provider) is user-fixable, not a partial success. Surface the
