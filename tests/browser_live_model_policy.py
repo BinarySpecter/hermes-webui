@@ -29,6 +29,13 @@ WHY THIS EXISTS
   last one resolves. The route handler is put in "hold" mode so response timing
   is released deterministically from the test (never with a blocking sleep).
 
+  Two more cases lock in the #7404 separation of policy authority from
+  per-target authority: the composer (`#modelSelect`) and Settings
+  (`#settingsModel`) selects are independent live-model publishers, so a rebuild
+  of one must not reject an in-flight request for the other, and the pending
+  projection must be per-target. Both directions are driven through the real
+  production entry points (`loadSettingsPanel()` and `populateModelDropdown()`).
+
 USAGE
   python tests/browser_live_model_policy.py
   (Requires: playwright + chromium. Boots server.py on an ephemeral port with an
@@ -78,6 +85,14 @@ PROFILE_SAME_PROFILE_RACE = "policy-profile-same-race"
 # replacement's models are distinguishable from the held broad response's.
 PROFILE_SAVE_POLICY = "policy-profile-save"
 AFTER_POLICY_CATALOG = [{"id": "after-policy-live-1", "label": "After Policy Live 1"}]
+# #7404 review: composer (modelSelect) and Settings (settingsModel) are
+# independent live-model publishers. Their own catalogs make a cross-target
+# rebuild that drops one of them observable.
+PROFILE_TARGET_A = "policy-profile-target-a"
+PROFILE_TARGET_B = "policy-profile-target-b"
+PROFILE_TARGET_PENDING = "policy-profile-target-pending"
+COMPOSER_CATALOG = [{"id": "composer-live-1", "label": "Composer Live 1"}]
+SETTINGS_CATALOG = [{"id": "settings-live-1", "label": "Settings Live 1"}]
 
 BENIGN = [
     "favicon",
@@ -130,6 +145,25 @@ def _wait_for_option(page, model_id: str, timeout: float = 8000.0) -> bool:
     try:
         page.wait_for_function(
             "id => Array.from(document.querySelectorAll('#modelSelect option'))"
+            ".some(o => o.value === id)",
+            arg=model_id,
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _settings_option_values(page) -> list[str]:
+    return page.evaluate(
+        "Array.from(document.querySelectorAll('#settingsModel option')).map(o => o.value)"
+    )
+
+
+def _wait_for_settings_option(page, model_id: str, timeout: float = 8000.0) -> bool:
+    try:
+        page.wait_for_function(
+            "id => Array.from(document.querySelectorAll('#settingsModel option'))"
             ".some(o => o.value === id)",
             arg=model_id,
             timeout=timeout,
@@ -455,7 +489,94 @@ def main() -> int:
             )
         print("OK  in-flight response dropped after profile changed:", ids_after_inflight)
 
-        # --- Case 4: overlapping requests must keep the pending key alive -----
+        # --- Case 4: composer held, Settings rebuild (direction A) -------------
+        #
+        # The reported bug: loadSettingsPanel() advanced the GLOBAL policy
+        # generation, so a valid composer request already in flight was then
+        # rejected as stale with no replacement. A Settings rebuild must only
+        # supersede settingsModel; the composer must still publish its catalog.
+        page.evaluate(f"S.activeProfile = {PROFILE_TARGET_A!r}")
+        stub.live_models = list(COMPOSER_CATALOG)
+        stub.hold_live = True
+        stub.held_routes = []
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("direction A: composer fetch was never held")
+        # Rebuild the Settings dropdown through its production path while the
+        # composer request is in flight.
+        stub.live_models = list(SETTINGS_CATALOG)
+        page.evaluate("void loadSettingsPanel()")
+        if not _wait_for_held_routes(stub, 2, page):
+            raise AssertionError("direction A: Settings fetch was never held")
+        # Release both: the composer (older, held across the Settings rebuild)
+        # first, then the Settings response.
+        stub.live_models = list(COMPOSER_CATALOG)
+        stub.release_live(stub.held_routes[0])
+        stub.live_models = list(SETTINGS_CATALOG)
+        stub.release_live(stub.held_routes[1])
+        if not _wait_for_option(page, "composer-live-1"):
+            raise AssertionError(
+                "direction A: the composer catalog was dropped when Settings was "
+                "rebuilt — its in-flight request was rejected with no "
+                f"replacement; composer options={_option_values(page)!r}"
+            )
+        if not _wait_for_settings_option(page, "settings-live-1"):
+            raise AssertionError(
+                "direction A: the Settings catalog did not publish; "
+                f"settings options={_settings_option_values(page)!r}"
+            )
+        print(
+            "OK  Settings rebuild left the composer catalog intact:",
+            _option_values(page),
+            "settings:",
+            _settings_option_values(page),
+        )
+
+        # --- Case 5: Settings held, composer rebuild (direction B) -------------
+        #
+        # The reverse: a composer/session refresh (populateModelDropdown) advanced
+        # the global generation, rejecting an in-flight settingsModel request.
+        # A composer rebuild must only supersede the composer.
+        page.evaluate(f"S.activeProfile = {PROFILE_TARGET_B!r}")
+        stub.live_models = list(SETTINGS_CATALOG)
+        stub.hold_live = True
+        stub.held_routes = []
+        page.evaluate("void loadSettingsPanel()")
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("direction B: Settings fetch was never held")
+        # Production composer rebuild while the Settings request is in flight.
+        stub.live_models = list(COMPOSER_CATALOG)
+        page.evaluate("void populateModelDropdown()")
+        if not _wait_for_held_routes(stub, 2, page):
+            raise AssertionError("direction B: composer fetch was never held")
+        stub.live_models = list(SETTINGS_CATALOG)
+        stub.release_live(stub.held_routes[0])
+        stub.live_models = list(COMPOSER_CATALOG)
+        stub.release_live(stub.held_routes[1])
+        if not _wait_for_settings_option(page, "settings-live-1"):
+            raise AssertionError(
+                "direction B: the Settings catalog was dropped when the composer "
+                "was rebuilt — its in-flight request was rejected with no "
+                f"replacement; settings options={_settings_option_values(page)!r}"
+            )
+        if not _wait_for_option(page, "composer-live-1"):
+            raise AssertionError(
+                "direction B: the composer catalog did not publish; "
+                f"composer options={_option_values(page)!r}"
+            )
+        print(
+            "OK  composer rebuild left the Settings catalog intact:",
+            _settings_option_values(page),
+            "composer:",
+            _option_values(page),
+        )
+
+        # --- Case 6: overlapping requests must keep the pending key alive -----
         #
         # syncTopbar() defers a model correction while a fetch is pending, so the
         # observable requirement is: while ANY request for a key is in flight,
@@ -488,27 +609,52 @@ def main() -> int:
             raise AssertionError(
                 "concurrency: key must be pending while both requests are in flight"
             )
+        # Two overlapping requests for the same target must share ONE
+        # reference-counted key (2), not two per-request keys.
+        if not _wait_for_js(
+            page, "key => _liveModelFetchPending.get(key) === 2", pending_key
+        ):
+            raise AssertionError(
+                "concurrency: expected two overlapping same-target requests to "
+                "share one pending reference count of 2"
+            )
 
-        # Release ONLY the older response. Its completion is observable: the
-        # catalog it carries reaches the dropdown. The newer request is still
-        # held, so the key MUST still be pending afterwards.
+        # Under the per-target latest-request authority (#7404 review), the
+        # SECOND request supersedes the first. Releasing the OLDER response must
+        # therefore NOT apply its catalog, while the shared key decays 2 -> 1
+        # because the newer request is still in flight. Pre-fix the older one
+        # was still applicable, so the drop assertion below is the behavioural
+        # delta (the 2 -> 1 decay is orthogonal and unchanged).
         stub.release_live(stub.held_routes[0])
+        if not _wait_for_js(
+            page,
+            "key => _liveModelFetchPending.has(key) && _liveModelFetchPending.get(key) === 1",
+            pending_key,
+        ):
+            raise AssertionError(
+                "concurrency: pending entry did not decay 2 -> 1 after the older "
+                "of two overlapping same-target requests completed while the "
+                "newer was still in flight"
+            )
+        if "concurrent-live-1" in _option_values(page):
+            raise AssertionError(
+                "concurrency: the superseded older response applied its catalog "
+                f"after a newer same-target request had claimed the target; "
+                f"options={_option_values(page)!r}"
+            )
+        print(
+            "OK  pending key decayed 2 -> 1 and the superseded response was "
+            "rejected"
+        )
+
+        # Release the last (newest) response; now the catalog lands and only
+        # then may the key clear.
+        stub.release_live(stub.held_routes[1])
         if not _wait_for_option(page, "concurrent-live-1"):
             raise AssertionError(
-                "concurrency: the first (older) request never completed after "
-                f"being released; options={_option_values(page)!r}"
+                "concurrency: the newest overlapping request never applied its "
+                f"catalog after being released; options={_option_values(page)!r}"
             )
-        if not page.evaluate("key => _liveModelFetchPending.has(key)", pending_key):
-            raise AssertionError(
-                "concurrency: pending entry cleared after the FIRST of two "
-                "overlapping requests completed while a newer request for the same "
-                "profile+provider is still in flight — syncTopbar() would now "
-                "persist a static fallback over the session's intended model"
-            )
-        print("OK  pending key survived the first of two overlapping requests")
-
-        # Release the last response; only now may the key clear.
-        stub.release_live(stub.held_routes[1])
         if not _wait_for_js(
             page, "key => !_liveModelFetchPending.has(key)", pending_key
         ):
@@ -518,7 +664,7 @@ def main() -> int:
             )
         print("OK  pending key cleared after the last overlapping request")
 
-        # --- Case 5: older broad response cannot win a same-profile race -------
+        # --- Case 7: older broad response cannot win a same-profile race -------
         #
         # #7404 review blocking finding: response applicability was fenced only
         # by the active profile (and an optional requestSeq). The Settings caller
@@ -599,7 +745,7 @@ def main() -> int:
             f"(live requests {broad_requests}->{stub.live_request_count})",
         )
 
-        # --- Case 6: saveSettings policy change invalidates AND re-requests ----
+        # --- Case 8: saveSettings policy change invalidates AND re-requests ----
         #
         # #7404 review P1: saveSettings() advanced the live-model policy
         # generation on a changed default-model save but started no replacement
@@ -694,6 +840,77 @@ def main() -> int:
             f"(live requests {requests_before_save}->{stub.live_request_count}, "
             f"replacement_held={replacement_held})",
         )
+
+        # --- Case 9: pending ownership is per-target --------------------------
+        #
+        # #7404 review: _liveModelFetchKey() carried profile+provider+policy
+        # generation but no target identity, so a settingsModel fetch and a
+        # modelSelect fetch shared one pending key. syncTopbar() queries that key
+        # to defer a composer model correction, so a Settings-only fetch made
+        # the composer look pending (and could hide a real composer fetch).
+        # Assert the two targets keep independent pending state in both
+        # directions. The composer/settings key expressions work pre-fix too
+        # (the extra select arg is just ignored by the old two-arg signature),
+        # so a pre-fix failure reports the collision rather than a missing API.
+        page.evaluate(f"S.activeProfile = {PROFILE_TARGET_PENDING!r}")
+        stub.live_models = list(SETTINGS_CATALOG)
+        stub.hold_live = True
+        stub.held_routes = []
+        settings_pending_expr = (
+            "_liveModelFetchPending.has(_liveModelFetchKey("
+            "window._activeProvider, undefined, document.getElementById('settingsModel')))"
+        )
+        composer_pending_expr = (
+            "_liveModelFetchPending.has(_liveModelFetchKey("
+            "window._activeProvider, undefined, document.getElementById('modelSelect')))"
+        )
+        # Settings-only fetch in flight: the composer must NOT look pending.
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('settingsModel');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("pending isolation: Settings fetch was never held")
+        if page.evaluate("() => " + composer_pending_expr):
+            raise AssertionError(
+                "pending isolation: a Settings-only live fetch is reported as "
+                "composer pending — syncTopbar() would defer the composer's model "
+                "correction and hide a real composer fetch"
+            )
+        if not page.evaluate("() => " + settings_pending_expr):
+            raise AssertionError(
+                "pending isolation: the in-flight Settings fetch should be pending"
+            )
+        stub.release_live(stub.held_routes[0])
+        if not _wait_for_js(page, "() => !" + settings_pending_expr):
+            raise AssertionError("pending isolation: Settings pending key never cleared")
+        stub.held_routes = []
+
+        # Composer-only fetch in flight: Settings must NOT look pending.
+        stub.live_models = list(COMPOSER_CATALOG)
+        page.evaluate(
+            "() => {"
+            "  const sel = document.getElementById('modelSelect');"
+            f"  void _fetchLiveModels({PROVIDER!r}, sel);"
+            "}"
+        )
+        if not _wait_for_held_routes(stub, 1, page):
+            raise AssertionError("pending isolation: composer fetch was never held")
+        if page.evaluate("() => " + settings_pending_expr):
+            raise AssertionError(
+                "pending isolation: a composer-only live fetch is reported as "
+                "Settings pending"
+            )
+        if not page.evaluate("() => " + composer_pending_expr):
+            raise AssertionError(
+                "pending isolation: the in-flight composer fetch should be pending"
+            )
+        stub.release_live(stub.held_routes[0])
+        if not _wait_for_js(page, "() => !" + composer_pending_expr):
+            raise AssertionError("pending isolation: composer pending key never cleared")
+        print("OK  composer and Settings pending state are independent")
 
         if errors:
             raise AssertionError(f"unexpected browser errors: {errors!r}")

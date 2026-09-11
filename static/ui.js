@@ -3561,16 +3561,24 @@ function _persistSessionModelCorrection(model, provider, opts){
 let _modelDropdownRequestSeq=0;
 let _modelCatalogFallbackRetried=false;
 
-// #7404 review: every live-model response is fenced by an immutable latest-owner
-// token. The active profile alone cannot distinguish two requests issued under
-// the same profile but different model policies (a broad discovered catalog vs
-// a strict pin) -- and `_addLiveModelsToSelect()` is additive, so a late broad
-// response would otherwise re-append a model the newer strict policy removed.
-// `generation` advances on same-profile policy saves and authoritative
-// dropdown/settings refreshes; `selectIdentity` advances whenever the target
-// <select> is authoritatively rebuilt. Both halves are read from live state at
-// check time (the select identity off the element itself, never a WeakMap), so
-// a stale request can neither mutate the list nor re-sync the chip.
+// #7404 review: live-model applicability has TWO independent authorities.
+//
+//  * `_liveModelPolicyGeneration` is GLOBAL and advances ONLY on a genuine
+//    provider/model policy change (a default-model save or a provider
+//    add/remove/refresh). A policy change invalidates every in-flight response
+//    captured before it, across all selects.
+//  * Each <select> owns a per-target latest-request sequence
+//    (`sel.__liveModelOwnerSeq`). Rebuilding one select (composer or Settings)
+//    advances only ITS sequence, so it supersedes its own older requests and
+//    never the other select's. `_fetchLiveModels()` claims a fresh sequence at
+//    request start, so "the newest request for a target wins" is intrinsic to
+//    the request rather than dependent on every caller.
+//
+// A response is applied only while its immutable owner token still matches the
+// live profile, the live policy generation, and its target's latest sequence.
+// Both halves are read from live state at check time (the sequence off the
+// element itself, never a WeakMap), so a stale request can neither mutate the
+// list nor re-sync the chip.
 let _liveModelPolicyGeneration=0;
 function _liveModelAdvancePolicyGeneration(){
   _liveModelPolicyGeneration++;
@@ -3581,11 +3589,17 @@ function _liveModelAdvanceSelectIdentity(sel){
   _liveModelOwnerSeq++;
   sel.__liveModelOwnerSeq=_liveModelOwnerSeq;
 }
+function _liveModelTargetIdentity(sel){
+  if(sel&&sel.id) return String(sel.id);
+  const fallback=(typeof $==='function')?$('modelSelect'):null;
+  return (fallback&&fallback.id)?String(fallback.id):'';
+}
 function _liveModelOwnerToken(provider, sel){
   return {
     profile:(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default',
     provider:String(provider||''),
     generation:_liveModelPolicyGeneration,
+    targetId:_liveModelTargetIdentity(sel),
     selectIdentity:(sel&&typeof sel.__liveModelOwnerSeq==='number')?sel.__liveModelOwnerSeq:null,
     sel:sel||null,
   };
@@ -3712,11 +3726,10 @@ async function populateModelDropdown(opts={}){
       return; // no server groups and no configured fallback
     }
     const previousSelection=_captureModelDropdownSelection(sel);
-    // Authoritative rebuild of this select: bump the policy generation and the
-    // select's owner identity so any live-model response captured before this
-    // render (under a now-superseded policy) is rejected before it can mutate
-    // the fresh list.
-    _liveModelAdvancePolicyGeneration();
+    // Authoritative rebuild of THIS select (the composer). Advance only its
+    // per-target latest-request sequence, never the global policy generation:
+    // the Settings select is an independent publisher, so a composer rebuild
+    // must not invalidate its in-flight live request (#7404 review).
     _liveModelAdvanceSelectIdentity(sel);
     // Clear existing options
     sel.innerHTML='';
@@ -3787,22 +3800,23 @@ async function populateModelDropdown(opts={}){
 // discovered catalog after the same profile switched to a strict model pin and
 // never reach the policy-aware server cache (#7404 review). Always fetch.
 //
-// Tracks profile+provider+policy-generation triples with a live-model fetch in
-// flight. Keyed by the same authority as the request so a pending fetch for one
-// profile/generation cannot suppress another's (and so an older generation's
-// completion decrements its own counter, never a newer generation's). Used by
-// syncTopbar() to defer model corrections until the fetch completes, preventing
-// premature fallback to the first static model (#1169). Calling this without an
-// explicit generation resolves to the CURRENT generation, so `has()` there still
-// means "at least one in-flight request for the current authority".
+// Tracks profile+provider+policy-generation+target-select tuples with a
+// live-model fetch in flight. Carrying the target identity keeps the composer
+// and Settings pending states independent: syncTopbar() observes only the
+// composer key, so a Settings-only fetch cannot make the composer look pending
+// (nor hide a composer fetch behind a Settings one). Keyed by the same
+// authority as the request so an older generation's completion decrements its
+// own counter, never a newer generation's. Calling this without an explicit
+// select resolves to the composer select, so `has()` there still means "at
+// least one in-flight request for the current composer authority".
 const _liveModelFetchPending=new Map();
-function _liveModelFetchKey(provider, generation){
+function _liveModelFetchKey(provider, generation, sel){
   const profile=(typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'default';
   const policyGeneration=(typeof generation==='number')?generation:_liveModelPolicyGeneration;
-  return profile+'\u0000'+String(provider||'')+'\u0000'+String(policyGeneration);
+  return profile+'\u0000'+String(provider||'')+'\u0000'+String(policyGeneration)+'\u0000'+_liveModelTargetIdentity(sel);
 }
 function _liveModelFetchBegin(provider, ownerToken){
-  const key=_liveModelFetchKey(provider, ownerToken?ownerToken.generation:undefined);
+  const key=_liveModelFetchKey(provider, ownerToken?ownerToken.generation:undefined, ownerToken?ownerToken.sel:undefined);
   _liveModelFetchPending.set(key,(_liveModelFetchPending.get(key)||0)+1);
   return key;
 }
@@ -3914,9 +3928,17 @@ function _addLiveModelsToSelect(provider, models, sel){
 async function _fetchLiveModels(provider, sel, requestSeq=null){
   if(!provider||!sel) return;
   if(requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq) return;
+  // Claim a FRESH per-target latest-request token at fetch start. This makes
+  // "the newest request for this select wins" intrinsic to the request instead
+  // of relying on every caller to advance identity first -- the recurring
+  // source of cross-target stale-rejection bugs. An older overlapping request
+  // for the same select becomes stale and cannot re-append its catalog after
+  // the newer one.
+  _liveModelAdvanceSelectIdentity(sel);
   // Capture an immutable latest-owner token at fetch start: active profile,
-  // provider, model-policy generation, and target-select identity. See
-  // _isLiveModelOwnerCurrent() for the full staleness contract.
+  // provider, model-policy generation, target identity, and this request's own
+  // per-target sequence. See _isLiveModelOwnerCurrent() for the staleness
+  // contract.
   const ownerToken=_liveModelOwnerToken(provider, sel);
   const fetchKey=_liveModelFetchBegin(provider, ownerToken);
   try{
@@ -11272,7 +11294,7 @@ function syncTopbar(){
         // session with the wrong model before live models arrive (#1169). The
         // entry is reference-counted, so it persists until the LAST in-flight
         // request for this key completes (overlapping fetches share one key).
-        const liveStillPending=window._activeProvider&&_liveModelFetchPending.has(_liveModelFetchKey(window._activeProvider));
+        const liveStillPending=window._activeProvider&&_liveModelFetchPending.has(_liveModelFetchKey(window._activeProvider, undefined, $('modelSelect')));
         if(liveStillPending||missingModelIsRoutable){
           // Live fetch in flight — don't touch sel.value or S.session.model yet.
           // _addLiveModelsToSelect() will re-apply S.session.model once done (#1169).

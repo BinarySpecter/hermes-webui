@@ -9264,13 +9264,14 @@ async function loadSettingsPanel(){
     // Populate model dropdown from /api/models + live model fetch (#872)
     const modelSel=$('settingsModel');
     if(modelSel){
-      // #7404 review: this is an authoritative settings rebuild. Advance the
-      // policy generation and this select's owner identity before the
-      // unrequestSeq'd _fetchLiveModels() call below so a live response held
-      // from a previous settings open cannot append stale models to the
-      // rebuilt list. Starts its own replacement fetch below, so do NOT route
-      // through _liveModelPolicyChanged() (that would double-fetch).
-      if(typeof _liveModelAdvancePolicyGeneration==='function') _liveModelAdvancePolicyGeneration();
+      // #7404 review: this is an authoritative rebuild of the Settings select
+      // ONLY. Advance ITS per-target latest-request sequence, never the global
+      // policy generation: the composer is an independent publisher, so a
+      // Settings rebuild must not invalidate a composer live-model request that
+      // is already in flight (nor vice versa). The unrequestSeq'd
+      // _fetchLiveModels() call below starts its own replacement for
+      // settingsModel, so do NOT route through _liveModelPolicyChanged() (that
+      // would double-fetch).
       if(typeof _liveModelAdvanceSelectIdentity==='function') _liveModelAdvanceSelectIdentity(modelSel);
       modelSel.innerHTML='';
       let models=null;
